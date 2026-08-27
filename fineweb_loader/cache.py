@@ -170,7 +170,13 @@ class ShardCache:
         progress: Callable[[int, int], None] | None,
         verify: bool,
     ) -> None:
-        url = self.manifest.url_for(entry, root=self.bucket_root)
+        # A corpus manifest carries its own base URL; bucket_root remains the
+        # override used by tests and mirrors.
+        url = (
+            self.manifest.url_for(entry)
+            if self.manifest.base_url and self.bucket_root == BUCKET_ROOT
+            else self.manifest.url_for(entry, root=self.bucket_root)
+        )
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         partial = path.with_suffix(path.suffix + ".part")
         digest = hashlib.sha256()

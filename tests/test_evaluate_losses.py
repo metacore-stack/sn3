@@ -352,3 +352,83 @@ class CliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# -- multi-corpus (2026-08-27 contract) -------------------------------------
+
+CORPORA = ("finewebedu", "automathtext-v2", "dclm-baseline-1.0")
+
+
+def blended(gaps=(0.30, 0.05, 0.20), per_corpus=40, seed=5):
+    """A king/challenger pair spanning all three evaluation corpora."""
+    rng = random.Random(seed)
+    refs, king, chall = [], [], []
+    for corpus, gap in zip(CORPORA, gaps):
+        shard = f"{corpus}__group0__part0__shard_000000.npy"
+        for i in range(per_corpus):
+            refs.append(f"{shard}#{i}")
+            k = 3.0 + rng.gauss(0, 0.2)
+            king.append(k)
+            chall.append(k - gap + rng.gauss(0, 0.01))
+    return vec("king", refs, king), vec("challenger", refs, chall)
+
+
+class CorpusBreakdownTests(unittest.TestCase):
+    def test_live_delta_is_the_new_bar(self):
+        from evaluate_losses.engine import LIVE_DELTA
+
+        self.assertEqual(LIVE_DELTA, 0.1)
+        self.assertEqual(StatsSpec().delta_threshold, 0.1)
+
+    def test_corpus_of_handles_hyphens_and_dots(self):
+        from evaluate_losses.lossvec import corpus_of
+
+        self.assertEqual(
+            corpus_of("dclm-baseline-1.0__global-shard_01_of_10--local_0__part0__s.npy#7"),
+            "dclm-baseline-1.0",
+        )
+        self.assertEqual(
+            corpus_of("automathtext-v2__math_web--0-10__part0__shard_000000.npy#1"),
+            "automathtext-v2",
+        )
+
+    def test_by_corpus_partitions(self):
+        king, _ = blended(per_corpus=10)
+        groups = king.by_corpus()
+        self.assertEqual(sorted(groups), sorted(CORPORA))
+        self.assertEqual(len(groups["finewebedu"]), 10)
+        self.assertEqual(king.corpora(), sorted(CORPORA))
+
+    def test_comparison_reports_each_corpus(self):
+        king, challenger = blended()
+        result = compare(king, challenger, per_shard=False)
+        self.assertEqual(len(result.by_corpus), 3)
+        labels = {v.label for v in result.by_corpus}
+        self.assertEqual(labels, set(CORPORA))
+
+    def test_weakest_corpus_is_identified(self):
+        # automathtext-v2 is given the smallest gap in the fixture.
+        king, challenger = blended(gaps=(0.30, 0.05, 0.20))
+        result = compare(king, challenger, per_shard=False)
+        self.assertEqual(result.weakest_corpus.label, "automathtext-v2")
+        self.assertLess(result.weakest_corpus.mu_hat, result.overall.mu_hat)
+
+    def test_a_checkpoint_can_pass_overall_and_fail_a_corpus(self):
+        # Overall clears 0.1; automathtext-v2 alone does not.
+        king, challenger = blended(gaps=(0.30, 0.05, 0.20))
+        result = compare(king, challenger, stats=StatsSpec(delta_threshold=0.1))
+        self.assertTrue(result.overall.accepted)
+        weakest = result.weakest_corpus
+        self.assertFalse(weakest.accepted)
+
+    def test_single_corpus_vectors_report_no_breakdown(self):
+        refs = [f"{CORPORA[0]}__g__p__s.npy#{i}" for i in range(20)]
+        king = vec("king", refs, [3.0] * 20)
+        chall = vec("challenger", refs, [2.5] * 20)
+        self.assertEqual(compare(king, chall, per_shard=False).by_corpus, ())
+
+    def test_json_includes_the_corpus_view(self):
+        king, challenger = blended(per_corpus=20)
+        payload = compare(king, challenger, per_shard=False).to_dict()
+        self.assertIn("by_corpus", payload)
+        self.assertEqual(len(payload["by_corpus"]), 3)

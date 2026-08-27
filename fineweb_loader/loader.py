@@ -204,3 +204,189 @@ class FineWebLoader:
             f"<FineWebLoader shards_open={len(self._open)} "
             f"holdouts={len(self._holdouts)} excluded={len(self._banned)}>"
         )
+
+
+class BlendedLoader:
+    """A loader over several corpora, resolving each ref to its source.
+
+    Same contract as :class:`FineWebLoader` -- refs in, token sequences out,
+    holdouts strictly enforced -- but a ref may name a shard in any of the
+    evaluation corpora. The corpus is read from the shard-name prefix, so
+    callers never have to say which source a sequence came from.
+    """
+
+    def __init__(
+        self,
+        corpora,
+        *,
+        holdouts: Sequence[SequenceSet] = (),
+        prefer_numpy: bool = True,
+    ):
+        self.corpora = corpora
+        self.prefer_numpy = prefer_numpy
+        self.stats = LoaderStats()
+        self._holdouts: list[SequenceSet] = list(holdouts)
+        self._banned: set[SequenceRef] = set()
+        for holdout in self._holdouts:
+            self._banned |= holdout.as_set()
+        self._loaders: dict[str, FineWebLoader] = {}
+
+    # -- delegation --------------------------------------------------------
+
+    def _loader_for(self, shard_name: str) -> FineWebLoader:
+        corpus = self.corpora.corpus_of(shard_name)
+        if corpus.name not in self._loaders:
+            # Holdouts are enforced here, not in the per-corpus loaders, so a
+            # single blended set covering several sources is honoured whole.
+            self._loaders[corpus.name] = FineWebLoader(
+                corpus.manifest, corpus.cache, prefer_numpy=self.prefer_numpy
+            )
+        return self._loaders[corpus.name]
+
+    @property
+    def holdouts(self) -> tuple[SequenceSet, ...]:
+        return tuple(self._holdouts)
+
+    @property
+    def excluded_count(self) -> int:
+        return len(self._banned)
+
+    def add_holdout(self, holdout: SequenceSet) -> None:
+        self._holdouts.append(holdout)
+        self._banned |= holdout.as_set()
+
+    def contamination(self, refs: Iterable[SequenceRef]) -> set[SequenceRef]:
+        return {r for r in refs if r in self._banned}
+
+    def assert_clean(self, refs: Iterable[SequenceRef]) -> None:
+        overlap = self.contamination(refs)
+        if overlap:
+            sample = ", ".join(str(r) for r in sorted(overlap)[:5])
+            raise ContaminationError(
+                f"{len(overlap)} requested sequence(s) are held out (e.g. {sample}). "
+                "Training on them would invalidate every subsequent measurement."
+            )
+
+    # -- reading -----------------------------------------------------------
+
+    def sequences(self, refs: Sequence[SequenceRef], *, allow_holdout: bool = True):
+        if not allow_holdout:
+            self.assert_clean(refs)
+        collected: dict[SequenceRef, object] = {}
+        grouped: dict[str, list[SequenceRef]] = defaultdict(list)
+        for ref in refs:
+            grouped[self.corpora.corpus_of(ref.shard).name].append(ref)
+
+        for corpus_name, subset in grouped.items():
+            loader = self._loader_for(subset[0].shard)
+            rows = loader.sequences(subset, allow_holdout=True)
+            for ref, row in zip(subset, rows):
+                collected[ref] = row
+            self.stats.shards_opened = sum(
+                l.stats.shards_opened for l in self._loaders.values()
+            )
+            self.stats.bytes_downloaded = sum(
+                l.stats.bytes_downloaded for l in self._loaders.values()
+            )
+
+        self.stats.sequences_read += len(refs)
+        rows = [collected[r] for r in refs]
+        if NUMPY_AVAILABLE and self.prefer_numpy and rows:
+            import numpy as np
+
+            return np.stack(rows)
+        return rows
+
+    def batches(
+        self,
+        refs: Sequence[SequenceRef],
+        batch_size: int = 8,
+        *,
+        allow_holdout: bool = True,
+    ) -> Iterator[tuple[list[SequenceRef], object]]:
+        if batch_size < 1:
+            raise LoaderError("batch_size must be at least 1")
+        if not allow_holdout:
+            self.assert_clean(refs)
+        window = list(refs)
+        for start in range(0, len(window), batch_size):
+            chunk = window[start : start + batch_size]
+            yield chunk, self.sequences(chunk, allow_holdout=True)
+
+    def training_stream(
+        self,
+        *,
+        seed: int,
+        shards: Sequence[str],
+        batch_size: int = 8,
+        max_batches: int | None = None,
+        proportions: dict[str, float] | None = None,
+    ) -> Iterator[tuple[list[SequenceRef], object]]:
+        """Shuffled training batches over several corpora.
+
+        When ``proportions`` is given, the pool is built to those shares rather
+        than to whatever the shard list happens to contain -- which is what you
+        want, because the validator draws 22/26/52 regardless of how many shards
+        of each you happen to have cached.
+        """
+        import random
+
+        rng = random.Random(seed)
+        by_corpus: dict[str, list[SequenceRef]] = defaultdict(list)
+        for shard_name in sorted(set(shards)):
+            corpus, entry = self.corpora.lookup(shard_name)
+            available = entry.sequences(corpus.manifest.seq_len)
+            for i in range(available):
+                ref = SequenceRef(entry.name, i)
+                if ref not in self._banned:
+                    by_corpus[corpus.name].append(ref)
+
+        if not by_corpus:
+            raise LoaderError("no trainable sequences remain after holdout exclusion")
+
+        if proportions:
+            # Size the pool so the rarest corpus is not the binding constraint
+            # any more than its share requires.
+            scale = min(
+                (len(refs) / proportions[name])
+                for name, refs in by_corpus.items()
+                if proportions.get(name)
+            )
+            pool: list[SequenceRef] = []
+            for name, refs in by_corpus.items():
+                want = int(scale * proportions.get(name, 0.0))
+                rng.shuffle(refs)
+                pool.extend(refs[:want])
+        else:
+            pool = [r for refs in by_corpus.values() for r in refs]
+
+        if not pool:
+            raise LoaderError("training pool is empty after proportional sizing")
+
+        rng.shuffle(pool)
+        self.assert_clean(pool)
+
+        emitted = 0
+        for start in range(0, len(pool), batch_size):
+            if max_batches is not None and emitted >= max_batches:
+                return
+            chunk = pool[start : start + batch_size]
+            yield chunk, self.sequences(chunk, allow_holdout=True)
+            emitted += 1
+
+    def close(self) -> None:
+        for loader in self._loaders.values():
+            loader.close()
+        self._loaders.clear()
+
+    def __enter__(self) -> "BlendedLoader":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+    def __repr__(self) -> str:
+        return (
+            f"<BlendedLoader corpora={len(self.corpora)} "
+            f"holdouts={len(self._holdouts)} excluded={len(self._banned)}>"
+        )

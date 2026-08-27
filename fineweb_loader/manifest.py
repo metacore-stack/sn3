@@ -56,10 +56,29 @@ class ShardEntry:
         return self.key.rsplit("/", 1)[-1]
 
     @property
-    def crawl(self) -> str | None:
-        """Common Crawl dump, e.g. ``CC-MAIN-2019-43``."""
+    def corpus(self) -> str | None:
+        """Corpus this shard belongs to, from the filename prefix.
+
+        ``finewebedu__CC-MAIN-2019-43__part1__shard_000076.npy`` -> ``finewebedu``.
+        Names are corpus-prefixed, so a bare shard name is unambiguous across
+        all three evaluation sources.
+        """
+        return self.name.split("__", 1)[0] or None
+
+    @property
+    def group(self) -> str | None:
+        """Second path component: a crawl for FineWeb-Edu, a subset elsewhere.
+
+        ``CC-MAIN-2019-43`` / ``math_web--0-10`` /
+        ``global-shard_01_of_10--local-shard_0_of_10``.
+        """
         parts = self.name.split("__")
         return parts[1] if len(parts) > 2 else None
+
+    @property
+    def crawl(self) -> str | None:
+        """Deprecated alias for :attr:`group`, kept for existing callers."""
+        return self.group
 
     @property
     def part(self) -> str | None:
@@ -89,7 +108,13 @@ class ManifestStats:
 class ShardManifest:
     """The 125,441-entry shard inventory, plus verification and selection."""
 
-    def __init__(self, payload: dict[str, Any], *, source: str | None = None):
+    def __init__(
+        self,
+        payload: dict[str, Any],
+        *,
+        source: str | None = None,
+        base_url: str | None = None,
+    ):
         if not isinstance(payload, dict):
             raise ManifestError("manifest payload is not a JSON object")
         rows = payload.get("shards")
@@ -97,6 +122,10 @@ class ShardManifest:
             raise ManifestError("manifest contains no shards")
         self.payload = payload
         self.source = source
+        # Bucket prefix for this corpus. When set, shard URLs are this plus the
+        # key; the shard_prefix reconstruction below is the single-corpus
+        # fallback from before the dataset became a blend.
+        self.base_url = base_url.rstrip("/") if base_url else None
         self.entries: tuple[ShardEntry, ...] = tuple(
             ShardEntry(
                 key=str(row["key"]),
@@ -115,18 +144,22 @@ class ShardManifest:
     # -- construction ------------------------------------------------------
 
     @classmethod
-    def load(cls, path: Path) -> "ShardManifest":
+    def load(cls, path: Path, *, base_url: str | None = None) -> "ShardManifest":
         try:
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
             raise ManifestError(f"{path} does not exist; run 'manifest sync'") from exc
         except json.JSONDecodeError as exc:
             raise ManifestError(f"{path} is not valid JSON: {exc}") from exc
-        return cls(payload, source=str(path))
+        return cls(payload, source=str(path), base_url=base_url)
 
     @classmethod
     def download(
-        cls, url: str = DEFAULT_MANIFEST_URL, *, timeout: float = 120.0
+        cls,
+        url: str = DEFAULT_MANIFEST_URL,
+        *,
+        timeout: float = 120.0,
+        base_url: str | None = None,
     ) -> tuple["ShardManifest", bytes]:
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         try:
@@ -138,7 +171,11 @@ class ShardManifest:
             payload = json.loads(raw.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ManifestError(f"{url} returned invalid JSON: {exc}") from exc
-        return cls(payload, source=url), raw
+        return cls(
+            payload,
+            source=url,
+            base_url=base_url or url.rsplit("/", 1)[0],
+        ), raw
 
     def save(self, path: Path) -> Path:
         path = Path(path)
@@ -263,16 +300,23 @@ class ShardManifest:
         """
         if isinstance(entry, str):
             entry = self.lookup(entry)
+        if self.base_url and root == BUCKET_ROOT:
+            return f"{self.base_url}/{entry.key.lstrip('/')}"
         namespace = self.shard_prefix.split("/", 1)[0]
         return f"{root.rstrip('/')}/{namespace}/{entry.key.lstrip('/')}"
 
-    def by_crawl(self) -> dict[str, list[ShardEntry]]:
+    def by_group(self) -> dict[str, list[ShardEntry]]:
+        """Shards grouped by their second path component."""
         grouped: dict[str, list[ShardEntry]] = {}
         for entry in self.entries:
-            grouped.setdefault(entry.crawl or "unknown", []).append(entry)
+            grouped.setdefault(entry.group or "unknown", []).append(entry)
         for shards in grouped.values():
             shards.sort(key=lambda e: e.key)
         return dict(sorted(grouped.items()))
+
+    def by_crawl(self) -> dict[str, list[ShardEntry]]:
+        """Deprecated alias for :meth:`by_group`."""
+        return self.by_group()
 
     def full_shards(self, minimum: int = FULL_SHARD_SEQUENCES) -> list[ShardEntry]:
         """Shards with at least ``minimum`` addressable sequences.

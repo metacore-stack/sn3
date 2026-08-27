@@ -9,7 +9,7 @@ from pathlib import Path
 
 from . import __version__
 from .compare import compare
-from .engine import StatsSpec, describe
+from .engine import LIVE_DELTA, StatsSpec, describe
 from .errors import (
     EXIT_FAILED,
     EXIT_OK,
@@ -79,6 +79,22 @@ def cmd_compare(args) -> int:
     print(f"  bootstrap cost   {_num(o.bootstrap_penalty)}   (mu_hat - lcb)")
     print(f"  verdict          {'ACCEPT' if o.accepted else 'reject'}")
 
+    if result.by_corpus:
+        print(f"\nper corpus ({len(result.by_corpus)})  —  the blend is fixed at 22/26/52")
+        width = max(len(v.label) for v in result.by_corpus)
+        for v in sorted(result.by_corpus, key=lambda x: x.mu_hat):
+            flag = "  " if v.mu_hat > o.delta else " !"
+            print(
+                f" {flag} {v.label:<{width}}  n={v.n:<5} mu_hat={_num(v.mu_hat, 4)} "
+                f"lcb={_num(v.lcb, 4)}  king={_num(v.avg_king_loss, 4)}"
+            )
+        weakest = result.weakest_corpus
+        if weakest is not None and weakest.mu_hat <= o.delta:
+            print(
+                f"\n  weakest source is {weakest.label} at {weakest.mu_hat:.4f}; "
+                "a fixed-blend evaluation pays for that on every submission"
+            )
+
     shards = result.by_shard
     if shards.shards:
         print(f"\nper shard ({len(shards.shards)})")
@@ -99,9 +115,9 @@ def cmd_compare(args) -> int:
         if clearing is not None:
             print(f"  shards clearing  {clearing * 100:.0f}%")
             print(
-                "\n  The validator draws every sequence of an evaluation from ONE\n"
-                "  shard, so treat the clearing fraction as your odds on a single\n"
-                "  draw — not the overall verdict above."
+                "\n  The validator draws one shard per corpus, so the clearing\n"
+                "  fraction is an estimate of a single draw's odds — not the\n"
+                "  overall verdict above."
             )
     return EXIT_OK if result.overall.accepted else EXIT_REJECTED
 
@@ -160,7 +176,10 @@ def build_parser() -> argparse.ArgumentParser:
     stats.add_argument("--alpha", type=float, default=0.001)
     stats.add_argument("--n-bootstrap", type=int, default=10000)
     stats.add_argument("--bootstrap-seed", type=int, default=0xB007)
-    stats.add_argument("--delta", type=float, default=0.5, help="live acceptance bar")
+    stats.add_argument(
+        "--delta", type=float, default=LIVE_DELTA,
+        help="live acceptance bar (0.1 since 2026-08-27)",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 

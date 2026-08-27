@@ -15,6 +15,7 @@ from pathlib import Path
 
 from fineweb_loader import cli
 from fineweb_loader.cache import ShardCache
+from dataclasses import replace
 from fineweb_loader.errors import (
     BudgetExceededError,
     ContaminationError,
@@ -630,3 +631,291 @@ class CliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# -- multi-corpus (2026-08-27 contract) -------------------------------------
+
+from fineweb_loader.corpus import (  # noqa: E402
+    Corpus,
+    CorpusSet,
+    DatasetConfig,
+    SourceSpec,
+    build_blended_holdout,
+    source_targets,
+    split_by_corpus,
+)
+from fineweb_loader.loader import BlendedLoader  # noqa: E402
+
+LIVE_PROPORTIONS = [0.22, 0.26, 0.52]
+LIVE_NAMES = ["finewebedu", "automathtext-v2", "dclm-baseline-1.0"]
+
+
+class SourceTargetsTests(unittest.TestCase):
+    """Largest-remainder apportionment, matching the validator exactly."""
+
+    def test_live_split_of_2000(self):
+        self.assertEqual(source_targets(2000, LIVE_PROPORTIONS), [440, 520, 1040])
+
+    def test_always_sums_to_total(self):
+        for total in (1, 7, 100, 999, 2000, 25000):
+            self.assertEqual(sum(source_targets(total, LIVE_PROPORTIONS)), total)
+
+    def test_remainder_goes_to_largest_fraction(self):
+        # 10 * [1/3, 1/3, 1/3] -> floors 3,3,3 with remainder 1 to index 0.
+        self.assertEqual(source_targets(10, [1 / 3, 1 / 3, 1 / 3]), [4, 3, 3])
+
+    def test_differs_from_naive_rounding(self):
+        # round() would give 1+1+1=3 here; apportionment must total 4.
+        proportions = [0.34, 0.33, 0.33]
+        self.assertEqual(sum(source_targets(4, proportions)), 4)
+
+    def test_single_source(self):
+        self.assertEqual(source_targets(2000, [1.0]), [2000])
+
+
+def make_dataset_config(names=LIVE_NAMES, proportions=LIVE_PROPORTIONS, delta=0.1):
+    return DatasetConfig(
+        config_version="cfg-v1",
+        dataset_label="-".join(names),
+        delta_threshold=delta,
+        eval_n=2000,
+        sources=tuple(
+            SourceSpec(
+                name=n,
+                proportion=p,
+                manifest_url=f"https://example.test/{n}/manifest.json",
+                manifest_sha256="",
+                tokenizer="XiaomiMiMo/MiMo-V2.5-Pro",
+                sequence_length=8,
+                dtype="uint32",
+            )
+            for n, p in zip(names, proportions)
+        ),
+    )
+
+
+class DatasetConfigTests(unittest.TestCase):
+    def test_targets_match_the_live_split(self):
+        self.assertEqual(
+            make_dataset_config().targets(),
+            {"finewebedu": 440, "automathtext-v2": 520, "dclm-baseline-1.0": 1040},
+        )
+
+    def test_base_url_is_derived_from_the_manifest_url(self):
+        spec = make_dataset_config().sources[1]
+        self.assertEqual(spec.base_url, "https://example.test/automathtext-v2")
+
+    def test_check_catches_bad_proportions(self):
+        bad = make_dataset_config(proportions=[0.2, 0.2, 0.2])
+        self.assertTrue(any("sum to" in p for p in bad.check()))
+
+    def test_check_catches_tokenizer_disagreement(self):
+        config = make_dataset_config()
+        sources = list(config.sources)
+        sources[0] = replace(sources[0], tokenizer="other/tokenizer")
+        mixed = replace(config, sources=tuple(sources))
+        self.assertTrue(any("tokenizer" in p for p in mixed.check()))
+
+    def test_from_payload_round_trip(self):
+        payload = {
+            "config_version": "abc",
+            "dataset_label": "blend",
+            "delta_threshold": 0.1,
+            "eval_n": 2000,
+            "sources": [
+                {"name": "a", "proportion": 0.5, "manifest_url": "https://x/a/manifest.json"},
+                {"name": "b", "proportion": 0.5, "manifest_url": "https://x/b/manifest.json"},
+            ],
+        }
+        config = DatasetConfig.from_payload(payload)
+        self.assertEqual(config.names, ["a", "b"])
+        self.assertEqual(config.delta_threshold, 0.1)
+        self.assertEqual(config.targets(10), {"a": 5, "b": 5})
+
+
+def build_corpus_set(root: Path, seq_len: int = 8) -> CorpusSet:
+    """Three synthetic corpora with realistic, corpus-prefixed shard names."""
+    config = make_dataset_config()
+    corpora = []
+    for spec in config.sources:
+        origin = root / spec.name
+        shards = {
+            f"{spec.name}__group{g}__part0__shard_{i:06d}.npy": 16
+            for g in range(3)
+            for i in range(2)
+        }
+        manifest = synth_manifest(origin, shards, seq_len=seq_len)
+        manifest.base_url = origin.as_uri()
+        cache = ShardCache(
+            root / "cache" / spec.name,
+            manifest,
+            budget_bytes=10**9,
+            bucket_root=origin.as_uri(),
+        )
+        corpora.append(Corpus(spec=spec, manifest=manifest, cache=cache))
+    return CorpusSet(config, corpora)
+
+
+class CorpusSetTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.corpora = build_corpus_set(self.root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_resolves_a_shard_to_its_corpus_by_prefix(self):
+        name = "dclm-baseline-1.0__group1__part0__shard_000000.npy"
+        self.assertEqual(self.corpora.corpus_of(name).name, "dclm-baseline-1.0")
+
+    def test_hyphenated_corpus_names_resolve(self):
+        # dclm-baseline-1.0 contains dots and hyphens; the split is on "__".
+        for name in self.corpora.names:
+            shard = f"{name}__group0__part0__shard_000000.npy"
+            self.assertEqual(self.corpora.corpus_of(shard).name, name)
+
+    def test_unknown_shard_raises(self):
+        with self.assertRaises(ShardNotFoundError):
+            self.corpora.corpus_of("nosuchcorpus__g__p__s.npy")
+
+    def test_lookup_returns_corpus_and_entry(self):
+        name = "finewebedu__group0__part0__shard_000000.npy"
+        corpus, entry = self.corpora.lookup(name)
+        self.assertEqual(corpus.name, "finewebedu")
+        self.assertEqual(entry.name, name)
+        self.assertEqual(entry.corpus, "finewebedu")
+
+    def test_stats_cover_every_source(self):
+        stats = self.corpora.stats()
+        self.assertEqual(set(stats["sources"]), set(LIVE_NAMES))
+        self.assertEqual(stats["targets"]["dclm-baseline-1.0"], 1040)
+
+    def test_verify_flags_a_missing_source(self):
+        partial = CorpusSet(self.corpora.config, [self.corpora["finewebedu"]])
+        self.assertTrue(any("not loaded" in p for p in partial.verify()))
+
+
+class BlendedHoldoutTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.corpora = build_corpus_set(self.root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_proportions_match_the_validator(self):
+        holdout = build_blended_holdout(
+            self.corpora, name="blend", seed=1, total=100, per_shard=8,
+            full_shards_only=False,
+        )
+        by_corpus = {k: len(v) for k, v in split_by_corpus(holdout).items()}
+        self.assertEqual(len(holdout), 100)
+        self.assertEqual(by_corpus, self.corpora.targets(100))
+
+    def test_deterministic(self):
+        a = build_blended_holdout(self.corpora, name="b", seed=7, total=60, per_shard=8, full_shards_only=False)
+        b = build_blended_holdout(self.corpora, name="b", seed=7, total=60, per_shard=8, full_shards_only=False)
+        self.assertEqual(a.refs, b.refs)
+
+    def test_different_seeds_differ(self):
+        a = build_blended_holdout(self.corpora, name="b", seed=1, total=60, per_shard=8, full_shards_only=False)
+        b = build_blended_holdout(self.corpora, name="b", seed=2, total=60, per_shard=8, full_shards_only=False)
+        self.assertNotEqual(a.refs, b.refs)
+
+    def test_disjoint_from_an_excluded_set(self):
+        first = build_blended_holdout(
+            self.corpora, name="a", seed=1, total=60, per_shard=8,
+            full_shards_only=False,
+        )
+        second = build_blended_holdout(
+            self.corpora, name="b", seed=1, total=60, per_shard=8, exclude=[first],
+            full_shards_only=False,
+        )
+        self.assertEqual(first.overlaps(second), set())
+
+    def test_spans_every_corpus(self):
+        holdout = build_blended_holdout(
+            self.corpora, name="b", seed=3, total=100, per_shard=8,
+            full_shards_only=False,
+        )
+        self.assertEqual(sorted(split_by_corpus(holdout)), sorted(LIVE_NAMES))
+
+
+class BlendedLoaderTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.corpora = build_corpus_set(self.root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _refs(self, per_corpus=2):
+        out = []
+        for name in self.corpora.names:
+            shard = f"{name}__group0__part0__shard_000000.npy"
+            out.extend(SequenceRef(shard, i) for i in range(per_corpus))
+        return out
+
+    def test_reads_across_corpora_in_order(self):
+        refs = self._refs()
+        with BlendedLoader(self.corpora) as loader:
+            rows = loader.sequences(refs)
+            self.assertEqual(len(rows), len(refs))
+            self.assertEqual(loader.stats.sequences_read, len(refs))
+
+    def test_contamination_guard_spans_corpora(self):
+        banned = self._refs(per_corpus=1)
+        holdout = SequenceSet(
+            name="h",
+            refs=tuple(banned),
+            seed=0,
+            manifest_sha256="cfg-v1",
+            seq_len=8,
+            created="",
+            strategy="test",
+        )
+        with BlendedLoader(self.corpora, holdouts=[holdout]) as loader:
+            self.assertEqual(loader.excluded_count, len(banned))
+            with self.assertRaises(ContaminationError):
+                loader.sequences(banned, allow_holdout=False)
+            # evaluation may still read them
+            self.assertEqual(len(loader.sequences(banned)), len(banned))
+
+    def test_training_stream_respects_proportions(self):
+        shards = [
+            f"{name}__group{g}__part0__shard_{i:06d}.npy"
+            for name in self.corpora.names
+            for g in range(3)
+            for i in range(2)
+        ]
+        proportions = {s.name: s.proportion for s in self.corpora.config.sources}
+        with BlendedLoader(self.corpora) as loader:
+            seen = []
+            for chunk, _ in loader.training_stream(
+                seed=1, shards=shards, batch_size=16, proportions=proportions
+            ):
+                seen.extend(chunk)
+        counts: dict[str, int] = {}
+        for ref in seen:
+            counts[ref.shard.split("__", 1)[0]] = (
+                counts.get(ref.shard.split("__", 1)[0], 0) + 1
+            )
+        total = sum(counts.values())
+        for name, share in proportions.items():
+            self.assertAlmostEqual(counts[name] / total, share, delta=0.05)
+
+    def test_training_stream_excludes_holdouts(self):
+        banned = self._refs(per_corpus=4)
+        holdout = SequenceSet(
+            name="h", refs=tuple(banned), seed=0, manifest_sha256="cfg-v1",
+            seq_len=8, created="", strategy="test",
+        )
+        shards = sorted({r.shard for r in banned})
+        with BlendedLoader(self.corpora, holdouts=[holdout]) as loader:
+            seen = set()
+            for chunk, _ in loader.training_stream(seed=2, shards=shards, batch_size=8):
+                seen.update(chunk)
+            self.assertEqual(seen & holdout.as_set(), set())

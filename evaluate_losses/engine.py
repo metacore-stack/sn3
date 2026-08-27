@@ -35,9 +35,15 @@ DEFAULT_BOOTSTRAP_B = 10000
 
 # engine.py:89. This is the engine's *fallback* threshold, matching the
 # Teutonic-I generation. The live bar arrives per request in
-# request.limits["delta_threshold"] and is currently 0.5. Never plan against
-# this value; read the live one from the dashboard or chain.toml.
+# request.limits["delta_threshold"]. Never plan against this value; read the
+# live one from the dataset manifest or chain.toml.
 ENGINE_FALLBACK_DELTA = 0.0015
+
+# Live acceptance bar. Lowered from 0.5 to 0.1 on 2026-08-27 in the same change
+# that expanded the corpus from FineWeb-Edu alone to a three-way blend. Kept
+# here as a default only; every command accepts --delta, and sn3_monitor will
+# flag a mismatch against the live configuration.
+LIVE_DELTA = 0.1
 
 # engine.py:148-150 -- seeds.
 DEFAULT_BOOTSTRAP_SEED = 0xB007  # 45063
@@ -123,7 +129,7 @@ class StatsSpec:
     alpha: float = DEFAULT_ALPHA
     n_bootstrap: int = DEFAULT_BOOTSTRAP_B
     bootstrap_seed: int = DEFAULT_BOOTSTRAP_SEED
-    delta_threshold: float = 0.5
+    delta_threshold: float = LIVE_DELTA
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

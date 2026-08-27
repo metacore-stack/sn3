@@ -80,10 +80,19 @@ def _render(report: Report, *, verbose: bool) -> None:
 def cmd_check(args) -> int:
     contract = Contract.load(args.chain)
     king = _resolve_king(args)
-    options = (
+    from .reuse import SubmissionLedger
+
+    ledger = None if args.no_ledger else SubmissionLedger.load(DEFAULT_CACHE.parent)
+    base = (
         Options.thorough(args.name)
         if args.thorough
         else Options(hash_shards=args.hash_shards, finite=args.finite, model_name=args.name)
+    )
+    options = Options(
+        hash_shards=base.hash_shards,
+        finite=base.finite,
+        model_name=base.model_name,
+        ledger=ledger,
     )
     report = validate(args.model_dir, contract=contract, king=king, options=options)
 
@@ -162,6 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--thorough", action="store_true", help="everything, including slow checks")
     p.add_argument("--json", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("--no-ledger", action="store_true", help="skip the local submission ledger")
     p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("contract", parents=[common], help="print the enforced contract")

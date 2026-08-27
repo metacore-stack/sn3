@@ -1,10 +1,15 @@
-"""Paired comparison, plus the per-shard breakdown that actually predicts odds.
+"""Paired comparison, with the per-corpus and per-shard views that predict odds.
 
 The overall LCB answers "is the challenger better across my whole holdout".
-That is not the question the validator asks. It draws all 2,000 sequences from a
-*single* shard, so what matters is how the improvement behaves shard by shard --
-you get exactly one draw, and a candidate that clears the bar only on average is
-a coin flip.
+That is not quite the question the validator asks. Since 2026-08-27 it draws
+2000 sequences split 22/26/52 across finewebedu, automathtext-v2 and
+dclm-baseline-1.0, taking a shard from each. So two things matter beyond the
+pooled number:
+
+* **per corpus** -- the blend is fixed, so a weakness in one source is paid for
+  on every submission, forever.
+* **per shard** -- within a corpus you still get one draw, so spread across
+  shards is the variance you actually face.
 """
 
 from __future__ import annotations
@@ -129,7 +134,7 @@ class ShardBreakdown:
 
 @dataclass(frozen=True)
 class Comparison:
-    """Overall verdict plus the per-shard view."""
+    """Overall verdict, plus the per-corpus and per-shard views."""
 
     overall: Verdict
     by_shard: ShardBreakdown
@@ -137,6 +142,18 @@ class Comparison:
     challenger_label: str
     sequence_set: str
     policy_path: str
+    by_corpus: tuple[Verdict, ...] = ()
+
+    @property
+    def weakest_corpus(self) -> Verdict | None:
+        """Corpus with the smallest improvement.
+
+        Evaluation is 22% finewebedu, 26% automathtext-v2, 52%
+        dclm-baseline-1.0. A checkpoint can clear the bar overall while losing
+        badly on one source, and since the blend is fixed that weakness is paid
+        for on every future submission.
+        """
+        return min(self.by_corpus, key=lambda v: v.mu_hat) if self.by_corpus else None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -145,6 +162,7 @@ class Comparison:
             "sequence_set": self.sequence_set,
             "policy_path": self.policy_path,
             "overall": self.overall.to_dict(),
+            "by_corpus": [v.to_dict() for v in self.by_corpus],
             "by_shard": self.by_shard.to_dict(),
         }
 
@@ -194,6 +212,17 @@ def compare(
 
     overall = _verdict("overall", king, challenger, stats)
 
+    corpus_verdicts: list[Verdict] = []
+    king_corpora = king.by_corpus()
+    challenger_corpora = challenger.by_corpus()
+    if len(king_corpora) > 1:
+        for corpus in sorted(set(king_corpora) & set(challenger_corpora)):
+            k, c = king_corpora[corpus], challenger_corpora[corpus]
+            if len(k) < min_shard_n:
+                continue
+            k.assert_aligned(c)
+            corpus_verdicts.append(_verdict(corpus, k, c, stats))
+
     shard_verdicts: list[Verdict] = []
     if per_shard:
         king_shards = king.by_shard()
@@ -213,6 +242,7 @@ def compare(
     return Comparison(
         overall=overall,
         by_shard=ShardBreakdown(tuple(shard_verdicts)),
+        by_corpus=tuple(corpus_verdicts),
         king_label=king.model_label,
         challenger_label=challenger.model_label,
         sequence_set=king.sequence_set,

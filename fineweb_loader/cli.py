@@ -19,7 +19,14 @@ from .errors import (
     ManifestError,
     ShardNotFoundError,
 )
-from .loader import FineWebLoader
+from .corpus import (
+    DATASET_CONFIG_URL,
+    CorpusSet,
+    DatasetConfig,
+    build_blended_holdout,
+    split_by_corpus,
+)
+from .loader import BlendedLoader, FineWebLoader
 from .manifest import DEFAULT_MANIFEST_URL, ShardManifest
 from .npyio import NUMPY_AVAILABLE
 from .refs import SequenceSet
@@ -33,6 +40,19 @@ def _root(args) -> Path:
 
 def _manifest_path(args) -> Path:
     return _root(args) / "fineweb-manifest.json"
+
+
+def _dataset_config_path(args) -> Path:
+    return _root(args) / "dataset-config.json"
+
+
+def _corpora(args) -> CorpusSet:
+    config = DatasetConfig.load(_dataset_config_path(args))
+    return CorpusSet.open(
+        config,
+        _root(args),
+        budget_bytes=int(args.budget * 1024**3) if args.budget else DEFAULT_BUDGET_BYTES,
+    )
 
 
 def _holdout_dir(args) -> Path:
@@ -127,6 +147,82 @@ def cmd_manifest_stats(args) -> int:
         print("\nshards per crawl:")
         for crawl, shards in manifest.by_crawl().items():
             print(f"  {crawl:22} {len(shards):>6,}")
+    return EXIT_OK
+
+
+# -- corpus -----------------------------------------------------------------
+
+
+def cmd_corpus_sync(args) -> int:
+    """Download the live dataset configuration and every source inventory."""
+    import json as _json
+    import urllib.request as _url
+
+    root = _root(args)
+    req = _url.Request(args.url, headers={"User-Agent": "fineweb-loader/1.0"})
+    payload = _json.loads(_url.urlopen(req, timeout=args.timeout).read().decode())
+    config = DatasetConfig.from_payload(payload, source_url=args.url)
+    config.save(_dataset_config_path(args), payload)
+
+    print(f"dataset       {config.dataset_label}")
+    print(f"config        {config.config_version}")
+    print(f"delta / n     {config.delta_threshold} / {config.eval_n}")
+    print(f"sources       {len(config.sources)}")
+    for problem in config.check():
+        print(f"  ! {problem}")
+
+    print()
+    for spec in config.sources:
+        target = root / "manifests" / f"{spec.name}.json"
+        if target.is_file() and not args.force:
+            manifest = ShardManifest.load(target, base_url=spec.base_url)
+            status = "cached"
+        else:
+            print(f"  downloading {spec.name} …", flush=True)
+            manifest, _ = ShardManifest.download(
+                spec.manifest_url, timeout=args.timeout, base_url=spec.base_url
+            )
+            manifest.save(target)
+            status = "fetched"
+        ok = manifest.digest == spec.manifest_sha256
+        print(
+            f"  {spec.name:22} {spec.proportion:>5.2f}  {len(manifest):>7,} shards  "
+            f"{status:8} digest {'OK' if ok else 'MISMATCH'}"
+        )
+        if not ok:
+            print(f"      expected {spec.manifest_sha256}")
+            print(f"      computed {manifest.digest}")
+            return EXIT_INTEGRITY
+
+    print(f"\n  per-evaluation split of n={config.eval_n}:")
+    for name, count in config.targets().items():
+        print(f"    {name:22} {count:>5}")
+    return EXIT_OK
+
+
+def cmd_corpus_status(args) -> int:
+    corpora = _corpora(args)
+    stats = corpora.stats()
+    config = corpora.config
+    print(f"dataset       {config.dataset_label}")
+    print(f"config        {config.config_version}")
+    print(f"delta / n     {config.delta_threshold} / {config.eval_n}")
+    print()
+    print(f"  {'corpus':24} {'share':>6} {'shards':>9} {'tokens':>16} {'size':>10} {'cached':>7} {'draw':>6}")
+    for name, s in stats["sources"].items():
+        print(
+            f"  {name:24} {s['proportion']:>6.2f} {s['shards']:>9,} {s['tokens']:>16,} "
+            f"{_human(s['bytes']):>10} {s['cached']:>7} {stats['targets'].get(name, 0):>6}"
+        )
+    t = stats["total"]
+    print(f"  {'TOTAL':24} {'':>6} {t['shards']:>9,} {t['tokens']:>16,} {_human(t['bytes']):>10}")
+    problems = corpora.verify()
+    print()
+    if problems:
+        for p in problems:
+            print(f"  ! {p}")
+        return EXIT_INTEGRITY
+    print("  all sources verified against the live configuration")
     return EXIT_OK
 
 
@@ -228,6 +324,46 @@ def cmd_holdout_build(args) -> int:
     print(f"  seed            {holdout.seed}")
     print(f"  manifest        {holdout.manifest_sha256[:16]}…")
     print(f"  strategy        {holdout.strategy}")
+    if existing:
+        print(f"  disjoint from   {', '.join(o.name for o in existing)}")
+    print(f"  written to      {path}")
+    return EXIT_OK
+
+
+def cmd_holdout_blend(args) -> int:
+    """Build a holdout mirroring the validator's corpus proportions."""
+    corpora = _corpora(args)
+    existing = []
+    directory = _holdout_dir(args)
+    if directory.exists():
+        for path in sorted(directory.glob("*.json")):
+            other = SequenceSet.load(path)
+            if other.name != args.name:
+                existing.append(other)
+
+    holdout = build_blended_holdout(
+        corpora,
+        name=args.name,
+        seed=args.seed,
+        total=args.total,
+        per_shard=args.per_shard,
+        exclude=existing,
+        notes=tuple(args.note or ()),
+    )
+    path = holdout.save(directory / f"{args.name}.json")
+    by_corpus = split_by_corpus(holdout)
+    print(f"built {holdout.name}")
+    print(f"  sequences       {len(holdout):,}")
+    print(f"  shards          {len(holdout.shards())}")
+    print(f"  config version  {holdout.manifest_sha256[:24]}…")
+    print("  per corpus:")
+    target = corpora.targets(args.total or corpora.config.eval_n)
+    for name, refs in by_corpus.items():
+        share = len(refs) / len(holdout)
+        print(
+            f"    {name:24} {len(refs):>6} sequences  {share:>6.2%}  "
+            f"(validator draws {target.get(name, 0)})"
+        )
     if existing:
         print(f"  disjoint from   {', '.join(o.name for o in existing)}")
     print(f"  written to      {path}")
@@ -337,6 +473,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--crawls", action="store_true", help="break down by crawl")
     p.set_defaults(func=cmd_manifest_stats)
 
+    # corpus
+    c0 = sub.add_parser("corpus", help="the multi-source evaluation corpus").add_subparsers(
+        dest="command", required=True
+    )
+    p = c0.add_parser("sync", parents=[common], help="download config and every inventory")
+    p.add_argument("--url", default=DATASET_CONFIG_URL)
+    p.add_argument("--timeout", type=float, default=300.0)
+    p.add_argument("--force", action="store_true", help="re-download cached inventories")
+    p.set_defaults(func=cmd_corpus_sync)
+
+    p = c0.add_parser("status", parents=[common], help="sources, sizes and draw sizes")
+    p.set_defaults(func=cmd_corpus_status)
+
     # shard
     s = sub.add_parser("shard", help="individual shards").add_subparsers(
         dest="command", required=True
@@ -366,6 +515,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-short-shards", action="store_true")
     p.add_argument("--note", action="append")
     p.set_defaults(func=cmd_holdout_build)
+
+    p = h.add_parser("blend", parents=[common], help="holdout across all corpora")
+    p.add_argument("--name", required=True)
+    p.add_argument("--seed", type=int, required=True)
+    p.add_argument("--total", type=int, help="sequences in total (default: eval_n)")
+    p.add_argument("--per-shard", type=int, default=128)
+    p.add_argument("--note", action="append")
+    p.set_defaults(func=cmd_holdout_blend)
 
     p = h.add_parser("list", parents=[common], help="list holdouts")
     p.set_defaults(func=cmd_holdout_list)

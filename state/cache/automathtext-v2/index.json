@@ -1,0 +1,12 @@
+{
+  "budget_bytes": 6442450944,
+  "entries": {
+    "shards/automathtext-v2__math_web--0-10__part0__shard_000000.npy": {
+      "key": "shards/automathtext-v2__math_web--0-10__part0__shard_000000.npy",
+      "last_used": 1787853477.9815822,
+      "name": "automathtext-v2__math_web--0-10__part0__shard_000000.npy",
+      "sha256": "26ef44d41a2c15f024485e1d66903f92cdd4d29577db8e73439ec44ae2453e2c",
+      "size_bytes": 50331776
+    }
+  }
+}

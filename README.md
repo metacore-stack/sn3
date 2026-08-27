@@ -664,3 +664,119 @@ Stages for selective freezing: `shared` (6.8% of parameters on the miniature),
   mid-run.
 - **Restoring locked files onto a miniature produced an incoherent checkpoint.**
   Hence the shape guard above.
+
+---
+
+# Contract change — 2026-08-27
+
+SN3 was re-specified at ~10:41 UTC. Two changes, either of which alone resets the
+strategy:
+
+**The bar dropped 5×.** `delta_threshold: 0.5 → 0.1`, confirmed in `chain.toml`,
+the dataset manifest and the live `current_eval`. A king crowned before the
+change still reports `king.delta = 0.5`; the dataset manifest is authoritative.
+
+**The corpus tripled.** FineWeb-Edu is now 22% of a fixed blend:
+
+| corpus | share | shards | tokens | of n=2000 |
+|---|---:|---:|---:|---:|
+| `finewebedu` | 22% | 125,441 | 1.57 T | 440 |
+| `automathtext-v2` | 26% | 151,131 | 1.90 T | 520 |
+| `dclm-baseline-1.0` | 52% | 297,617 | 3.73 T | 1,040 |
+| **total** | | **574,189** | **7.20 T** | 28.8 TB |
+
+All three use the same tokenizer, `uint32` dtype, 2048 sequence length and
+128-byte `.npy` header, so everything below the manifest layer was reusable.
+
+Also new: **`safetensors_reuse_limit`** — a checkpoint's combined safetensors
+digest may complete at most **3** evaluations — and configurable early stopping.
+
+The architecture did not change: all six contract hashes are identical, so the
+router patch and the 42-key config lock stand.
+
+## What this cost the field
+
+Within six hours, twelve of fourteen challengers scored **−0.5 to −1.05**. They
+were FineWeb-Edu-optimised models meeting a corpus that is 78% something else.
+Only two were positive, the best at 0.081 — 81% of the new bar.
+
+## The monitor caught all of it
+
+```
+$ sn3-monitor check                                    exit 1 (STALE)
+  STALE  king.king_digest                    c345e657… → 2eb8fe82…
+  STALE  delta_threshold                     0.5 → 0.1
+  STALE  datasets.config_version             7f8db63f… → 4d4c31b6…
+  STALE  datasets.sources[automathtext-v2]   a new evaluation corpus appeared
+  STALE  datasets.sources[dclm-baseline-1.0] a new evaluation corpus appeared
+  WARN   delta consistency                   king=0.5 datasets=0.1
+```
+
+## New: multi-corpus support
+
+```bash
+fineweb corpus sync            # config + all three inventories, digests verified
+fineweb corpus status          # sizes, shares, cached counts, per-eval draw
+fineweb holdout blend --name blend-a --seed 1 --total 2000 --per-shard 64
+```
+
+`build_blended_holdout` allocates with the validator's own largest-remainder
+apportionment (`_source_targets`), not `round()` — the two differ, and the
+difference would make a holdout subtly unrepresentative.
+
+```
+built blend-a
+  sequences  2,000    shards 33
+    automathtext-v2      520  26.00%  (validator draws 520)
+    dclm-baseline-1.0   1040  52.00%  (validator draws 1040)
+    finewebedu           440  22.00%  (validator draws 440)
+```
+
+`BlendedLoader` resolves any ref to its corpus from the shard-name prefix, so
+holdouts and training pools span sources transparently. `training_stream` accepts
+`proportions` and sizes the pool to the validator's shares rather than to
+whatever is cached — measured on real data:
+
+```
+finewebedu          0.223  vs target 0.22
+automathtext-v2     0.259  vs target 0.26
+dclm-baseline-1.0   0.518  vs target 0.52
+overlap with holdout: 0
+```
+
+`train-mimo train` now defaults to the blend and warns when a corpus is absent
+from the shard list; `--single-corpus` keeps the old path for comparison runs.
+
+## New: per-corpus evaluation
+
+`evaluate compare` reports each source alongside the pooled number, because the
+blend is fixed and a weakness in one corpus is paid for on every submission:
+
+```
+per corpus (3)  —  the blend is fixed at 22/26/52
+ !  automathtext-v2      n=40  mu_hat=0.0512  lcb=0.0448  king=3.0102
+    dclm-baseline-1.0    n=40  mu_hat=0.2003  lcb=0.1938  king=2.9871
+    finewebedu           n=40  mu_hat=0.3011  lcb=0.2944  king=3.0245
+
+  weakest source is automathtext-v2 at 0.0512; a fixed-blend
+  evaluation pays for that on every submission
+```
+
+Default `--delta` is now `0.1`.
+
+## New: reuse-limit tracking
+
+`validate check --thorough` computes the validator's combined safetensors digest
+— sorted by name, `name || NUL || raw-32-bytes`, folded into one SHA-256 — and
+consults a local ledger of what you have already submitted. The validator keeps
+the real count server-side; this catches a fourth submission of identical weights
+before it costs a hotkey.
+
+## Two bugs the refactor surfaced
+
+- **URL doubling.** `CorpusSet.open` initially loaded manifests without their
+  `base_url`, so the cache fell back to reconstructing the prefix from
+  `shard_prefix` and put the corpus name in the path twice — a 404 on every
+  non-FineWeb shard.
+- **Holdouts failed on small corpora.** Requesting more shards than a source has
+  raised instead of widening the per-shard sample. It now clamps.

@@ -107,6 +107,7 @@ def cmd_train(args) -> int:
         seq_len=seq_len,
         synthetic=args.synthetic,
         state_root=STATE_ROOT,
+        blend=not args.single_corpus,
     )
     config.manifest_sha256 = context.get("manifest_sha256")
 
@@ -139,6 +140,13 @@ def cmd_train(args) -> int:
         f"{trainer.freeze.total_params:,} parameters "
         f"({trainer.freeze.trainable_fraction * 100:.1f}%)"
     )
+    if context.get("corpora"):
+        print(f"  corpora   {', '.join(context['corpora'])}")
+        if context.get("missing_corpora"):
+            print(
+                f"  ! missing {', '.join(context['missing_corpora'])} — the validator "
+                "still scores them"
+            )
     if context.get("holdouts"):
         print(
             f"  holdouts {', '.join(context['holdouts'])} "
@@ -270,6 +278,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--shard", action="append", help="FineWeb shard name (repeatable)")
     p.add_argument("--holdout", action="append", help="holdout to exclude (repeatable)")
     p.add_argument("--synthetic", action="store_true", help="random tokens, no shards")
+    p.add_argument(
+        "--single-corpus", action="store_true",
+        help="train on finewebedu alone (22% of the score); comparison runs only",
+    )
     p.add_argument("--no-balance", action="store_true", help="disable the bias rule")
     p.add_argument("--model-dir", help="train a real checkpoint instead of a miniature")
     p.add_argument("--king", help="king directory, for restoring the locked files")

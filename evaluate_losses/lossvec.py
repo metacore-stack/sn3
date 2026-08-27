@@ -34,6 +34,16 @@ def shard_of(ref: str) -> str:
     return ref.rsplit("#", 1)[0]
 
 
+def corpus_of(ref: str) -> str:
+    """Corpus name from a ref, via the shard-name prefix.
+
+    ``dclm-baseline-1.0__global-shard_01…#417`` -> ``dclm-baseline-1.0``.
+    Evaluation now draws 22/26/52 from three sources, so a single pooled number
+    hides which of them a checkpoint is actually failing on.
+    """
+    return shard_of(ref).split("__", 1)[0]
+
+
 @dataclass(frozen=True)
 class LossVector:
     """Per-sequence losses aligned to the refs that produced them."""
@@ -83,6 +93,9 @@ class LossVector:
     def shards(self) -> list[str]:
         return sorted({shard_of(r) for r in self.refs})
 
+    def corpora(self) -> list[str]:
+        return sorted({corpus_of(r) for r in self.refs})
+
     def by_shard(self) -> dict[str, "LossVector"]:
         """Split into one vector per shard.
 
@@ -100,6 +113,25 @@ class LossVector:
                 model_label=self.model_label,
                 model_digest=self.model_digest,
                 sequence_set=f"{self.sequence_set}:{shard}",
+                manifest_sha256=self.manifest_sha256,
+                engine=dict(self.engine),
+                created=self.created,
+            )
+        return out
+
+    def by_corpus(self) -> dict[str, "LossVector"]:
+        """Split into one vector per evaluation corpus."""
+        grouped: dict[str, list[tuple[str, float]]] = defaultdict(list)
+        for ref, value in zip(self.refs, self.losses):
+            grouped[corpus_of(ref)].append((ref, value))
+        out: dict[str, LossVector] = {}
+        for corpus, rows in sorted(grouped.items()):
+            out[corpus] = LossVector(
+                refs=tuple(r for r, _ in rows),
+                losses=tuple(v for _, v in rows),
+                model_label=self.model_label,
+                model_digest=self.model_digest,
+                sequence_set=f"{self.sequence_set}:{corpus}",
                 manifest_sha256=self.manifest_sha256,
                 engine=dict(self.engine),
                 created=self.created,

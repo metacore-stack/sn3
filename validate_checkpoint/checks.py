@@ -491,6 +491,66 @@ def check_weights_changed(
             )
 
 
+# -- layer 4: reuse limit ---------------------------------------------------
+
+
+def check_reuse_limit(
+    report: Report, root: Path, ledger, *, hash_shards: bool
+) -> str | None:
+    """Mirrors ``engine.py:reject_reused_safetensors``.
+
+    The validator refuses a fourth evaluation of the same combined safetensors
+    digest. It keeps that count server-side, so all that can be done here is
+    consult a local record of what has already been sent.
+    """
+    from .reuse import MAX_COMPLETED_EVALS, snapshot_safetensors_digest
+
+    if not hash_shards:
+        report.skip(
+            "safetensors reuse limit",
+            Layer.EVALUATOR,
+            "needs shard hashes; pass --hash-shards or --thorough",
+        )
+        return None
+    try:
+        digest, _ = snapshot_safetensors_digest(root)
+    except FileNotFoundError as exc:
+        report.fail("safetensors reuse limit", Layer.EVALUATOR, str(exc))
+        return None
+
+    if ledger is None:
+        report.ok(
+            "safetensors reuse limit",
+            Layer.EVALUATOR,
+            f"digest {digest[:16]}\u2026 (no local ledger to compare against)",
+        )
+        return digest
+
+    uses = ledger.uses(digest)
+    if uses >= MAX_COMPLETED_EVALS:
+        report.fail(
+            "safetensors reuse limit",
+            Layer.EVALUATOR,
+            f"these exact weights are recorded as submitted {uses} time(s); "
+            f"the validator allows {MAX_COMPLETED_EVALS}",
+            error_code="safetensors_reuse_limit",
+        )
+    elif uses:
+        report.warn(
+            "safetensors reuse limit",
+            Layer.EVALUATOR,
+            f"submitted {uses}/{MAX_COMPLETED_EVALS} time(s) already; "
+            f"{ledger.remaining(digest)} left for these exact weights",
+        )
+    else:
+        report.ok(
+            "safetensors reuse limit",
+            Layer.EVALUATOR,
+            f"digest {digest[:16]}\u2026 not previously submitted",
+        )
+    return digest
+
+
 # -- layer 4: numerics ------------------------------------------------------
 
 

@@ -1,0 +1,12 @@
+{
+  "budget_bytes": 6442450944,
+  "entries": {
+    "shards/dclm-baseline-1.0__global-shard_01_of_10--local-shard_0_of_10__part0__shard_000000.npy": {
+      "key": "shards/dclm-baseline-1.0__global-shard_01_of_10--local-shard_0_of_10__part0__shard_000000.npy",
+      "last_used": 1787853477.969377,
+      "name": "dclm-baseline-1.0__global-shard_01_of_10--local-shard_0_of_10__part0__shard_000000.npy",
+      "sha256": "df45a10c88a01b31b6921861acf6b0ec2a8b3fe7d0e29131f647841c69b5e250",
+      "size_bytes": 50331776
+    }
+  }
+}

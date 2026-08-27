@@ -11,6 +11,7 @@ from .contract import Contract
 from .errors import ContractError, KingUnavailableError, SafetensorsFormatError, ValidationError
 from .king import KingReference
 from .report import Check, Layer, Report, Status
+from .reuse import MAX_COMPLETED_EVALS, SubmissionLedger, safetensors_digest_from_file_digests
 from .safetensors_io import SafetensorsHeader, TensorInfo, read_header
 from .validator import Options, validate
 
@@ -18,6 +19,7 @@ __all__ = [
     "Contract", "KingReference", "Report", "Check", "Layer", "Status",
     "SafetensorsHeader", "TensorInfo", "read_header",
     "validate", "Options",
+    "SubmissionLedger", "MAX_COMPLETED_EVALS", "safetensors_digest_from_file_digests",
     "ValidationError", "ContractError", "KingUnavailableError", "SafetensorsFormatError",
     "__version__",
 ]

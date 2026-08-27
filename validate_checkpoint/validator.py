@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 from pathlib import Path
 
 from . import checks
@@ -18,6 +19,7 @@ class Options:
     hash_shards: bool = False
     finite: bool = False
     model_name: str | None = None
+    ledger: Any = None
 
     @classmethod
     def thorough(cls, model_name: str | None = None) -> "Options":
@@ -70,6 +72,11 @@ def validate(
         checks.check_index(report, root, headers)
     checks.check_config_lock(report, root, contract, king)
     checks.check_weights_changed(report, root, king, hash_shards=options.hash_shards)
+    digest = checks.check_reuse_limit(
+        report, root, options.ledger, hash_shards=options.hash_shards
+    )
+    if digest:
+        report.context["safetensors_digest"] = digest
     checks.check_finite(report, headers, enabled=options.finite)
 
     return report

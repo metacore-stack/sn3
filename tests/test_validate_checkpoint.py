@@ -282,8 +282,16 @@ class RealContractTests(unittest.TestCase):
             self.assertIn(key, self.contract.locked_config_keys)
 
     def test_live_evaluation_settings(self):
+        # The bar dropped from 0.5 to 0.1 on 2026-08-27, in the same change that
+        # replaced the single FineWeb-Edu corpus with a three-way blend. This
+        # assertion is deliberately pinned: if it fails again, the contract moved
+        # again and every offline judgement needs re-checking.
         self.assertEqual(self.contract.eval_n, 2000)
-        self.assertEqual(self.contract.delta_threshold, 0.5)
+        self.assertEqual(self.contract.delta_threshold, 0.1)
+        self.assertEqual(
+            self.contract.dataset_label,
+            "finewebedu-automathtext-v2-dclm-baseline-1.0",
+        )
         self.assertIn(226, self.contract.initial_weight_uids)
 
     def test_real_name_pattern(self):
@@ -534,3 +542,123 @@ class CliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReuseLimitTests(unittest.TestCase):
+    """The safetensors reuse limit added on 2026-08-27."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_combined_digest_matches_the_validator_construction(self):
+        import hashlib
+
+        from validate_checkpoint.reuse import safetensors_digest_from_file_digests
+
+        digests = {
+            "model-00002.safetensors": "b" * 64,
+            "model-00001.safetensors": "a" * 64,
+        }
+        # engine.py: sorted by name, name || NUL || raw 32 bytes.
+        expected = hashlib.sha256()
+        for name in sorted(digests):
+            expected.update(name.encode("utf-8"))
+            expected.update(b"\0")
+            expected.update(bytes.fromhex(digests[name]))
+        self.assertEqual(
+            safetensors_digest_from_file_digests(digests), expected.hexdigest()
+        )
+
+    def test_digest_is_order_independent_but_name_sensitive(self):
+        from validate_checkpoint.reuse import safetensors_digest_from_file_digests
+
+        a = {"x.safetensors": "a" * 64, "y.safetensors": "b" * 64}
+        b = {"y.safetensors": "b" * 64, "x.safetensors": "a" * 64}
+        self.assertEqual(
+            safetensors_digest_from_file_digests(a),
+            safetensors_digest_from_file_digests(b),
+        )
+        c = {"z.safetensors": "a" * 64, "y.safetensors": "b" * 64}
+        self.assertNotEqual(
+            safetensors_digest_from_file_digests(a),
+            safetensors_digest_from_file_digests(c),
+        )
+
+    def test_rejects_malformed_digests(self):
+        from validate_checkpoint.reuse import safetensors_digest_from_file_digests
+
+        with self.assertRaises(FileNotFoundError):
+            safetensors_digest_from_file_digests({})
+        with self.assertRaises(ValueError):
+            safetensors_digest_from_file_digests({"a": "not-a-digest"})
+
+    def test_ledger_counts_and_limits(self):
+        from validate_checkpoint.reuse import MAX_COMPLETED_EVALS, SubmissionLedger
+
+        self.assertEqual(MAX_COMPLETED_EVALS, 3)
+        ledger = SubmissionLedger.load(self.root)
+        digest = "c" * 64
+        self.assertEqual(ledger.uses(digest), 0)
+        self.assertFalse(ledger.would_exceed(digest))
+        for i in range(MAX_COMPLETED_EVALS):
+            ledger.record(digest, self.root / f"ckpt-{i}", hotkey=f"hk{i}")
+        self.assertEqual(ledger.uses(digest), MAX_COMPLETED_EVALS)
+        self.assertEqual(ledger.remaining(digest), 0)
+        self.assertTrue(ledger.would_exceed(digest))
+
+    def test_ledger_persists(self):
+        from validate_checkpoint.reuse import SubmissionLedger
+
+        digest = "d" * 64
+        SubmissionLedger.load(self.root).record(digest, "somewhere")
+        self.assertEqual(SubmissionLedger.load(self.root).uses(digest), 1)
+
+    def test_corrupt_ledger_is_ignored(self):
+        from validate_checkpoint.reuse import LEDGER_FILENAME, SubmissionLedger
+
+        (self.root / LEDGER_FILENAME).write_text("{not json", encoding="utf-8")
+        self.assertEqual(SubmissionLedger.load(self.root).entries, [])
+
+    def test_check_fails_at_the_limit(self):
+        from validate_checkpoint.reuse import SubmissionLedger, snapshot_safetensors_digest
+
+        model, contract, king = build_checkpoint(self.root)
+        write_safetensors(
+            model / "model-00002-of-00002.safetensors",
+            {"model.layers.1.w": ("BF16", (2, 2), bf16(0x3F00, 4))},
+        )
+        digest, _ = snapshot_safetensors_digest(model)
+        ledger = SubmissionLedger.load(self.root)
+        for _ in range(3):
+            ledger.record(digest, model)
+
+        report = validate(
+            model,
+            contract=contract,
+            king=king,
+            options=Options(hash_shards=True, ledger=ledger),
+        )
+        check = next(c for c in report.checks if "reuse limit" in c.name)
+        self.assertIs(check.status, Status.FAIL)
+        self.assertIn("safetensors_reuse_limit", report.error_codes)
+
+    def test_check_passes_for_unseen_weights(self):
+        from validate_checkpoint.reuse import SubmissionLedger
+
+        model, contract, king = build_checkpoint(self.root)
+        write_safetensors(
+            model / "model-00002-of-00002.safetensors",
+            {"model.layers.1.w": ("BF16", (2, 2), bf16(0x3F00, 4))},
+        )
+        report = validate(
+            model,
+            contract=contract,
+            king=king,
+            options=Options(hash_shards=True, ledger=SubmissionLedger.load(self.root)),
+        )
+        check = next(c for c in report.checks if "reuse limit" in c.name)
+        self.assertIs(check.status, Status.PASS)
