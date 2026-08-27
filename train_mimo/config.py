@@ -16,6 +16,7 @@ from .errors import ConfigError
 
 # Parameter-group selectors, matched as substrings against parameter names.
 # Named stages exist so staged unfreezing is a config change, not a code change.
+# An empty include tuple means "everything"; excludes are applied afterwards.
 STAGES: dict[str, tuple[str, ...]] = {
     "shared": (".shared_experts.",),
     "shared+router": (".shared_experts.", ".gate.weight"),
@@ -26,7 +27,17 @@ STAGES: dict[str, tuple[str, ...]] = {
         ".gate.weight",
         ".self_attn.",
     ),
-    "all": (),  # empty means everything
+    # Every 2-D matrix, every 1-D vector frozen. This is the configuration the
+    # reign 6 -> 7 weight diff actually showed: embeddings, lm_head, attention,
+    # routed and shared experts and the router all moved 4.5-9.7%, while all 91
+    # norm tensors and attention_sink_bias were byte-identical.
+    "matrices": (),
+    "all": (),
+}
+
+# Substrings that veto a parameter even when the stage's include list matches.
+STAGE_EXCLUDES: dict[str, tuple[str, ...]] = {
+    "matrices": ("norm", "sink_bias", "e_score_correction_bias"),
 }
 
 
@@ -57,8 +68,29 @@ class OptimConfig:
     eps: float = 1e-8
     max_grad_norm: float = 1.0
     warmup_steps: int = 10
-    schedule: str = "cosine"  # cosine | linear | constant
+    schedule: str = "wsd"  # wsd | cosine | linear | constant
     min_lr_ratio: float = 0.1
+    # WSD only. The stable phase runs at full LR until the decay begins, which
+    # is what suits a target that moves every few hours: you do not have to
+    # commit to a token budget at step zero, and can branch a cooldown whenever
+    # a checkpoint looks promising.
+    decay_fraction: float = 0.2
+    decay_start_step: int | None = None
+
+
+@dataclass
+class DistributedConfig:
+    """Multi-process settings.
+
+    ``strategy`` is "none" single-process, "ddp" for replicated training and
+    "fsdp" for sharded parameters/gradients/optimizer state -- the last is what
+    a 110B checkpoint requires.
+    """
+
+    strategy: str = "none"
+    # Periodically assert every rank holds identical routing biases. Cheap, and
+    # it turns a silent divergence into an immediate error.
+    bias_check_every: int = 25
 
 
 @dataclass
@@ -91,6 +123,7 @@ class TrainingConfig:
     data: DataConfig = field(default_factory=DataConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     balance: BalanceConfig = field(default_factory=BalanceConfig)
+    distributed: DistributedConfig = field(default_factory=DistributedConfig)
 
     # Provenance, filled in by the runner.
     target_snapshot: str | None = None
@@ -109,8 +142,17 @@ class TrainingConfig:
             raise ConfigError("grad_accum must be at least 1")
         if self.data.batch_size < 1:
             raise ConfigError("batch_size must be at least 1")
-        if self.optim.schedule not in ("cosine", "linear", "constant"):
+        if self.optim.schedule not in ("wsd", "cosine", "linear", "constant"):
             raise ConfigError(f"unknown schedule {self.optim.schedule!r}")
+        if not 0.0 <= self.optim.decay_fraction <= 1.0:
+            raise ConfigError("decay_fraction must be between 0 and 1")
+        from .distributed import STRATEGIES
+
+        if self.distributed.strategy not in STRATEGIES:
+            raise ConfigError(
+                f"unknown strategy {self.distributed.strategy!r}; "
+                f"choose from {STRATEGIES}"
+            )
         overlap = set(self.data.shards) & set()
         if overlap:  # pragma: no cover - placeholder for future checks
             raise ConfigError(str(overlap))
@@ -118,6 +160,10 @@ class TrainingConfig:
     @property
     def trainable_patterns(self) -> tuple[str, ...]:
         return STAGES[self.stage]
+
+    @property
+    def excluded_patterns(self) -> tuple[str, ...]:
+        return STAGE_EXCLUDES.get(self.stage, ())
 
     @property
     def tokens_per_step(self) -> int:
@@ -139,6 +185,7 @@ class TrainingConfig:
             "data": DataConfig,
             "optim": OptimConfig,
             "balance": BalanceConfig,
+            "distributed": DistributedConfig,
         }
         for key, klass in nested.items():
             value = payload.get(key)

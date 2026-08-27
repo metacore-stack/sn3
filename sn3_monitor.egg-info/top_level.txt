@@ -1,3 +1,4 @@
+campaign
 evaluate_losses
 fineweb_loader
 mimo_adapter

@@ -18,6 +18,16 @@ from typing import Any, Callable, Iterator, Sequence
 from .balance import BalanceStats, LoadBalancer
 from .checkpoint import SaveResult, save_checkpoint
 from .config import TrainingConfig
+from .distributed import (
+    DistributedContext,
+    all_reduce_expert_counts,
+    all_reduce_mean,
+    assert_bias_synchronised,
+    barrier,
+    shard_stream,
+    unwrap,
+    wrap_model,
+)
 from .errors import DivergenceError, TrainingError
 from .optim import FreezeResult, apply_freeze, build_optimizer, build_scheduler, clip_gradients
 
@@ -103,23 +113,33 @@ class Trainer:
         king_dir: Path | None = None,
         output_dir: Path | None = None,
         on_log: Callable[[StepMetrics], None] | None = None,
+        context: DistributedContext | None = None,
     ):
-        self.model = model
         self.arch = arch
         self.config = config
-        self.batches = batches
+        self.context = context or DistributedContext()
+        # Each rank consumes a disjoint slice, so the collectives stay aligned.
+        self.batches = shard_stream(batches, self.context)
         self.king_dir = Path(king_dir) if king_dir else None
         self.output_dir = Path(output_dir or Path(config.output_dir) / config.run_name)
         self.on_log = on_log
 
-        self.freeze = apply_freeze(model, config.trainable_patterns)
-        self.optimizer = build_optimizer(model, config.optim)
+        # Order matters: freeze, then wrap, then build the optimizer. FSDP
+        # renames parameters when it wraps, after which the stage's substring
+        # patterns no longer match anything.
+        self.freeze = apply_freeze(
+            model, config.trainable_patterns, config.excluded_patterns
+        )
+        self.model = wrap_model(model, config.distributed.strategy, self.context)
+        self.optimizer = build_optimizer(self.model, config.optim)
         self.scheduler = build_scheduler(self.optimizer, config.max_steps, config.optim)
 
         from mimo_adapter.patch import gates
 
+        # Gates are found on the unwrapped module so DDP/FSDP prefixes do not
+        # hide them.
         self.balancer = LoadBalancer(
-            gates(model),
+            gates(unwrap(self.model)),
             update_rate=config.balance.update_rate,
             min_tokens=config.balance.min_tokens,
             enabled=config.balance.enabled,
@@ -208,7 +228,18 @@ class Trainer:
             self.optimizer.step()
             self.scheduler.step()
 
+            # THE distributed correctness step. Each rank routed different
+            # tokens, so without this every rank would move the routing bias
+            # differently and the ranks would silently disagree about routing.
+            recorder.counts = all_reduce_expert_counts(
+                recorder.counts, recorder.n_experts, self.context
+            )
             balance = self.balancer.update(recorder, step=self.step)
+            loss = all_reduce_mean(loss, self.context)
+
+            every = self.config.distributed.bias_check_every
+            if every and self.context.is_distributed and self.step % every == 0:
+                assert_bias_synchronised(self.balancer.gates, self.context)
 
             metrics = StepMetrics(
                 step=self.step,
@@ -245,8 +276,12 @@ class Trainer:
         )
 
     def save(self, metrics: StepMetrics | None = None) -> SaveResult:
+        # Every rank must reach this together: gathering a full state dict from
+        # FSDP is a collective. Only rank zero then writes.
+        barrier(self.context)
         result = save_checkpoint(
             model=self.model,
+            context=self.context,
             step=self.step,
             output_dir=self.output_dir,
             king_dir=self.king_dir,

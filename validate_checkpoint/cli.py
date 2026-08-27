@@ -148,6 +148,76 @@ def cmd_king(args) -> int:
     return EXIT_CLEAN
 
 
+def cmd_download(args) -> int:
+    """Fetch the king's weights. 220 GB, so it reports before it starts."""
+    from .download import KingDownloader, human
+
+    king = _resolve_king(args)
+    if king is None:
+        print("supply --king-digest", file=sys.stderr)
+        return EXIT_USAGE
+
+    downloader = KingDownloader(king, Path(args.dest), workers=args.workers)
+    plan = downloader.plan(verify_present=args.verify_present)
+
+    print(f"\n  king      {king.digest or '(local)'}")
+    print(f"  files     {len(plan.present)} present, {len(plan.missing)} missing"
+          f"{f', {len(plan.partial)} resumable' if plan.partial else ''}")
+    print(f"  to fetch  {human(plan.bytes_needed)} of {human(plan.total_bytes)}")
+    print(f"  free      {human(plan.free_bytes)} at {plan.destination}")
+    if not plan.enough_disk:
+        print(f"\n  NOT ENOUGH DISK — need {human(plan.bytes_needed)} plus margin.")
+        if not args.force:
+            return EXIT_WOULD_REJECT
+    if args.dry_run:
+        print("\n  --dry-run: nothing fetched.")
+        return EXIT_CLEAN
+    if not plan.missing:
+        print("\n  Nothing to do; every file is present.")
+        return EXIT_CLEAN
+
+    print()
+    state = {"last": -1}
+
+    def on_bytes(done: int, total: int) -> None:
+        pct = int(100 * done / total) if total else 100
+        if pct != state["last"]:
+            state["last"] = pct
+            print(f"\r  {pct:3d}%  {human(done)} / {human(total)}", end="", flush=True)
+
+    def on_file(progress) -> None:
+        mark = "ok  " if progress.complete else "FAIL"
+        resumed = f" (resumed at {human(progress.resumed_from)})" if progress.resumed_from else ""
+        print(f"\r  {mark} {progress.path}{resumed}{' ' * 20}")
+
+    results = downloader.fetch(
+        on_file=on_file, on_bytes=on_bytes, allow_insufficient_disk=args.force
+    )
+    verified = sum(1 for r in results if r.complete)
+    print(f"\n  {verified}/{len(results)} files verified against the manifest.")
+    return EXIT_CLEAN
+
+
+def cmd_verify(args) -> int:
+    """Re-hash a local checkpoint against the published manifest."""
+    from .download import KingDownloader
+
+    king = _resolve_king(args)
+    if king is None:
+        print("supply --king-digest", file=sys.stderr)
+        return EXIT_USAGE
+    downloader = KingDownloader(king, Path(args.dest), workers=args.workers)
+    bad = downloader.verify()
+    if not bad:
+        print(f"  all {len(king.files)} files match the manifest.")
+        return EXIT_CLEAN
+    print(f"  {len(bad)} file(s) missing or corrupt:")
+    for path in bad:
+        print(f"    - {path}")
+    print("\n  Re-run 'download' to repair; matching files are not re-fetched.")
+    return EXIT_WOULD_REJECT
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="validate",
@@ -179,6 +249,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("king", parents=[common], help="show the king's reference inventory")
     p.set_defaults(func=cmd_king)
+
+    p = sub.add_parser(
+        "download", parents=[common], help="fetch the king's weights (resumable, verified)"
+    )
+    p.add_argument("dest", help="destination directory")
+    p.add_argument("--workers", type=int, default=4, help="parallel file downloads")
+    p.add_argument("--dry-run", action="store_true", help="report the plan and stop")
+    p.add_argument("--force", action="store_true", help="proceed despite a low disk estimate")
+    p.add_argument(
+        "--verify-present", action="store_true", help="re-hash files already on disk"
+    )
+    p.set_defaults(func=cmd_download)
+
+    p = sub.add_parser(
+        "verify", parents=[common], help="re-hash a local checkpoint against the manifest"
+    )
+    p.add_argument("dest", help="directory holding the checkpoint")
+    p.add_argument("--workers", type=int, default=4)
+    p.set_defaults(func=cmd_verify)
 
     return parser
 

@@ -28,7 +28,9 @@ from mimo_adapter.miniature import (
     MiniatureSpec,
     build_miniature,
     count_parameters,
+    initialize_attention_sinks,
     initialize_gates,
+    uninitialized_parameters,
     miniature_config_dict,
 )
 from mimo_adapter.patch import (
@@ -179,7 +181,7 @@ class ArchTests(unittest.TestCase):
         # Uninitialised values come from torch.empty(), so what they contain is
         # by definition unpredictable — sometimes 1e38, sometimes recycled and
         # tame. Only the initialised state is worth asserting on.
-        model, config = self._model(init_gates=False)
+        model, config = self._model(initialize=False)
         count = initialize_gates(model, config, seed=3)
         self.assertEqual(count, len(gates(model)))
         std = float(getattr(config, "initializer_range", 0.02))
@@ -189,10 +191,64 @@ class ArchTests(unittest.TestCase):
             self.assertLess(weight.abs().max().item(), 10 * std)
             self.assertEqual(gate.e_score_correction_bias.abs().max().item(), 0.0)
 
-        again, _ = self._model(init_gates=False)
+        again, _ = self._model(initialize=False)
         initialize_gates(again, config, seed=3)
         for a, b in zip(gates(model), gates(again)):
             self.assertTrue(torch.equal(a.weight, b.weight))
+
+    def test_no_parameter_is_left_uninitialised(self):
+        """The architecture allocates three kinds of bare Parameter and fills none.
+
+        An unwritten parameter is read as whatever was in that memory, so two
+        processes with the same seed disagree and every local comparison carries
+        noise it did not earn. Measured on this miniature before the fix: 0.0096
+        nats between identical runs, a tenth of the live delta threshold.
+        """
+        self.assertEqual(
+            uninitialized_parameters(self.arch, self.reference, MiniatureSpec(),
+                                     initialize=True),
+            [],
+        )
+
+    def test_the_detector_actually_detects(self):
+        """A regression test that cannot pass vacuously."""
+        missed = uninitialized_parameters(
+            self.arch, self.reference, MiniatureSpec(), initialize=False
+        )
+        self.assertTrue(missed)
+        self.assertTrue(any("gate.weight" in n for n in missed))
+        self.assertTrue(any("attention_sink_bias" in n for n in missed))
+
+    def test_build_is_reproducible_from_a_seed(self):
+        a, _ = self._model(seed=7)
+        b, _ = self._model(seed=7)
+        sa, sb = a.state_dict(), b.state_dict()
+        self.assertEqual(set(sa), set(sb))
+        differing = [n for n in sa if not torch.equal(sa[n], sb[n])]
+        self.assertEqual(differing, [])
+
+    def test_attention_sinks_are_zeroed(self):
+        model, _ = self._model()
+        sinks = [
+            m.attention_sink_bias
+            for m in model.modules()
+            if getattr(m, "attention_sink_bias", None) is not None
+        ]
+        self.assertTrue(sinks, "the miniature should have SWA layers with sinks")
+        for sink in sinks:
+            self.assertEqual(sink.abs().max().item(), 0.0)
+            # Frozen in the shipped architecture, and the reign 6->7 diff shows
+            # the king's operator left every 1-D vector frozen too.
+            self.assertFalse(sink.requires_grad)
+
+    def test_initialize_attention_sinks_reports_what_it_touched(self):
+        model, _ = self._model(initialize=False)
+        touched = initialize_attention_sinks(model)
+        self.assertGreater(touched, 0)
+        self.assertEqual(touched, sum(
+            1 for m in model.modules()
+            if getattr(m, "attention_sink_bias", None) is not None
+        ))
 
     def test_shipped_gate_refuses_training(self):
         model, config = self._model()

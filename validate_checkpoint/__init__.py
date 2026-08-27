@@ -8,6 +8,7 @@ here instead.
 __version__ = "1.0.0"
 
 from .contract import Contract
+from .download import DownloadPlan, FileProgress, KingDownloader
 from .errors import ContractError, KingUnavailableError, SafetensorsFormatError, ValidationError
 from .king import KingReference
 from .report import Check, Layer, Report, Status
@@ -16,7 +17,8 @@ from .safetensors_io import SafetensorsHeader, TensorInfo, read_header
 from .validator import Options, validate
 
 __all__ = [
-    "Contract", "KingReference", "Report", "Check", "Layer", "Status",
+    "Contract", "KingReference",
+    "KingDownloader", "DownloadPlan", "FileProgress", "Report", "Check", "Layer", "Status",
     "SafetensorsHeader", "TensorInfo", "read_header",
     "validate", "Options",
     "SubmissionLedger", "MAX_COMPLETED_EVALS", "safetensors_digest_from_file_digests",

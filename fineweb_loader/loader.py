@@ -248,6 +248,24 @@ class BlendedLoader:
         return tuple(self._holdouts)
 
     @property
+    def manifest_digest(self) -> str:
+        """One digest identifying every manifest behind this blend.
+
+        A loss vector records which data it was measured on. Under a single
+        corpus that was the manifest's own digest; a blend needs a value that
+        changes if *any* source's manifest does, or two vectors measured on
+        different corpus versions would compare as though they matched.
+        """
+        from .manifest import canonical_sha256
+
+        return canonical_sha256(
+            {
+                corpus.name: getattr(corpus.manifest, "digest", "")
+                for corpus in self.corpora
+            }
+        )
+
+    @property
     def excluded_count(self) -> int:
         return len(self._banned)
 

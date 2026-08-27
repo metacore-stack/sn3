@@ -18,6 +18,11 @@ from .timeutil import age_of, humanize
 
 DEFAULT_MARGIN = 0.02
 DEFAULT_MAX_AGE = timedelta(minutes=15)
+# You are judged against whoever is king when your evaluation runs, not when you
+# submit. At ~57 min per evaluation, a queue that is 11 deep puts roughly ten
+# hours between the two, which is two reigns. Clearing today's bar by a hair is
+# how a submission dies in the queue.
+DEFAULT_MU_FLOOR = 0.11
 
 
 @dataclass(frozen=True)
@@ -63,7 +68,10 @@ def run_preflight(
     dashboard: Document,
     *,
     offline_lcb: float | None = None,
+    offline_mu: float | None = None,
+    packaging: Any = None,
     margin: float = DEFAULT_MARGIN,
+    mu_floor: float = DEFAULT_MU_FLOOR,
     max_age: timedelta = DEFAULT_MAX_AGE,
 ) -> PreflightResult:
     """Evaluate every gate. Order is presentation order, not short-circuit order."""
@@ -164,7 +172,76 @@ def run_preflight(
             )
         )
 
-    # 9. Winning only pays if validator weights are landing. Publication cycles
+    # 9. The mean, not just the bound. Under the three-corpus blend the gap
+    #    between mu_hat and the lower bound tripled (median 0.001627 -> 0.005490
+    #    near the threshold), so a vector that clears the bar on lcb alone is
+    #    thinner than it looks -- and it has to survive a reign change first.
+    if offline_mu is None:
+        checks.append(
+            Check(
+                "offline mu_hat headroom",
+                False,
+                Severity.WARN,
+                "not supplied; pass --offline-mu with your measured mean",
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                "offline mu_hat headroom",
+                offline_mu >= mu_floor,
+                Severity.WARN,
+                f"measured {offline_mu:.6f} vs floor {mu_floor:.6f}; the queue "
+                "means you are judged against a later king than this one",
+            )
+        )
+
+    # 10. Packaging. Roughly 1 in 11 live submissions died here rather than on
+    #     model quality, and every one of those deaths happened after 'ready'
+    #     had already spent the hotkey. Folding the validator in means the
+    #     interlock cannot be green while the artefact is unshippable.
+    if packaging is None:
+        checks.append(
+            Check(
+                "packaging validated",
+                False,
+                Severity.STALE,
+                "no validation report supplied; pass --model-dir so the "
+                "packaging rules run as part of this gate",
+            )
+        )
+    else:
+        would_reject = bool(getattr(packaging, "would_reject", False))
+        failures = list(getattr(packaging, "failures", ()) or ())
+        fatal = list(getattr(packaging, "fatal_failures", ()) or ())
+        if would_reject:
+            detail = f"{len(failures)} failing check(s)"
+            if fatal:
+                detail += (
+                    f", {len(fatal)} of them after 'ready' has spent the hotkey: "
+                    + ", ".join(getattr(c, "name", str(c)) for c in fatal[:3])
+                )
+        else:
+            detail = "every packaging rule that could run, passed"
+        checks.append(
+            Check("packaging validated", not would_reject, Severity.ABORT, detail)
+        )
+
+        skipped = list(getattr(packaging, "skipped", ()) or ())
+        determinate = bool(getattr(packaging, "determinate", True))
+        checks.append(
+            Check(
+                "packaging fully determined",
+                determinate,
+                Severity.WARN,
+                "every rule ran"
+                if determinate
+                else f"{len(skipped)} rule(s) could not run; re-check with "
+                "--king-digest --thorough before submitting",
+            )
+        )
+
+    # 11. Winning only pays if validator weights are landing. Publication cycles
     #    through in-flight states ("claimed", "submitted") on its way to
     #    "finalized", so a mid-cycle reading is healthy provided some earlier
     #    attempt did finalize. Only a failure with nothing ever finalized is bad.

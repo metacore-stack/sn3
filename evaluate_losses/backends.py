@@ -223,7 +223,7 @@ class TorchBackend(ScoringBackend):
             losses=tuple(losses),
             model_label=model_label,
             model_digest=self.model_digest,
-            manifest_sha256=getattr(self.loader.manifest, "digest", ""),
+            manifest_sha256=manifest_digest(self.loader),
             engine=self.spec.to_dict(),
             wall_time_s=round(time.monotonic() - started, 3),
         )
@@ -234,6 +234,18 @@ class TorchBackend(ScoringBackend):
             torch, _ = self._torch
             if torch.cuda.is_available():  # pragma: no cover - GPU only
                 torch.cuda.empty_cache()
+
+
+def manifest_digest(loader) -> str:
+    """Identify the data behind a loader, single-corpus or blended.
+
+    A blend has no one manifest, and reaching for ``loader.manifest`` on it
+    raises -- which is the path every real evaluation now takes.
+    """
+    blended = getattr(loader, "manifest_digest", None)
+    if blended:
+        return str(blended)
+    return str(getattr(getattr(loader, "manifest", None), "digest", "") or "")
 
 
 def expected_positions(seq_len: int = 2048) -> int:

@@ -165,6 +165,146 @@ def cmd_parity(args) -> int:
     return EXIT_OK
 
 
+def _store(args):
+    from .evidence import EvidenceStore
+
+    root = Path(args.evidence or (DEFAULT_ROOT / "evidence"))
+    return EvidenceStore(root).load()
+
+
+def cmd_plan(args) -> int:
+    """What a scoring run would measure, before it is paid for."""
+    from .scoring import plan
+
+    result = plan(args.model_dir, args.holdout, state_root=Path(args.root))
+    if args.json:
+        print(json.dumps(result.to_dict(), indent=2))
+        return EXIT_OK
+
+    print(f"\n  {result.model_dir}  on holdout {result.holdout_name!r}")
+    print(f"  {result.sequences} sequences\n")
+    actual, expected = result.actual_share, result.expected_share
+    for name in sorted(set(actual) | set(expected)):
+        print(
+            f"    {name:22} {result.per_corpus.get(name, 0):>6}  "
+            f"{actual.get(name, 0.0):6.1%} measured vs {expected.get(name, 0.0):6.1%} scored"
+        )
+    print(f"\n  worst mixture error  {result.max_share_error:.1%}")
+    for warning in result.warnings:
+        print(f"  ! {warning}")
+    if not result.warnings:
+        print("  This holdout tracks what the validator scores.")
+    return EXIT_OK
+
+
+def cmd_score(args) -> int:
+    """Score a checkpoint and, optionally, file the result as evidence."""
+    from .scoring import plan, score_checkpoint
+
+    preview = plan(args.model_dir, args.holdout, state_root=Path(args.root))
+    for warning in preview.warnings:
+        print(f"  ! {warning}", file=sys.stderr)
+    if preview.warnings and not args.force:
+        print(
+            "  refusing to spend a scoring run on this holdout; pass --force to "
+            "proceed anyway",
+            file=sys.stderr,
+        )
+        return EXIT_FAILED
+
+    state = {"last": -1}
+
+    def progress(done: int, total: int) -> None:
+        pct = int(100 * done / total) if total else 100
+        if pct != state["last"]:
+            state["last"] = pct
+            print(f"\r  scoring {pct:3d}%  ({done}/{total})", end="", flush=True)
+
+    vector = score_checkpoint(
+        args.model_dir,
+        args.holdout,
+        state_root=Path(args.root),
+        model_label=args.label or Path(args.model_dir).name,
+        model_digest=args.digest or "",
+        device_map=args.device_map,
+        limit=args.limit,
+        progress=None if args.quiet else progress,
+        out=Path(args.out) if args.out else None,
+    )
+    print(f"\r  scored {len(vector)} sequences in {vector.wall_time_s:.1f}s" + " " * 12)
+    print(f"  mean loss  {vector.mean:.6f}")
+    for name, part in sorted(vector.by_corpus().items()):
+        print(f"    {name:22} {len(part):>6}  {part.mean:.6f}")
+
+    if args.record:
+        from .evidence import Cost
+
+        store = _store(args)
+        entry = store.record(
+            vector,
+            run_id=args.record,
+            kind="king" if args.king else "challenger",
+            provenance={"model_dir": str(args.model_dir), "holdout": args.holdout},
+            cost=Cost(
+                gpu_hours=args.gpu_hours,
+                usd_per_gpu_hour=args.usd_per_gpu_hour,
+                n_gpus=args.n_gpus,
+            ),
+            overwrite=args.overwrite,
+        )
+        print(f"  recorded as {entry.run_id} ({entry.kind}) in {store.root}")
+    return EXIT_OK
+
+
+def cmd_evidence(args) -> int:
+    store = _store(args)
+
+    if args.evidence_command == "list":
+        records = store.ordered()
+        if not records:
+            print(f"  no records in {store.root}")
+            return EXIT_OK
+        print(f"\n  {store.root}  ({len(records)} records)\n")
+        for r in records:
+            mark = "KING" if r.kind == "king" else "    "
+            print(
+                f"  {mark} {r.run_id:24} {r.model_label:28} n={r.n:<6} "
+                f"mean={r.mean_loss:.6f}  {r.sequence_set}"
+            )
+        return EXIT_OK
+
+    if args.evidence_command == "spend":
+        print(json.dumps(store.spend(), indent=2))
+        return EXIT_OK
+
+    board = store.leaderboard(
+        king_run_id=args.king_run_id, stats=_stats(args)
+    )
+    if args.json:
+        print(json.dumps(board, indent=2))
+        return EXIT_OK
+
+    king = board["king"]
+    print(f"\n  against king {king['run_id']} ({king['label']}) mean {_num(king['mean_loss'])}")
+    print(f"  {board['challengers']} challengers · {board['accepted']} would be accepted")
+    if board["unrankable"]:
+        print(f"  {board['unrankable']} not comparable")
+    print()
+    print(f"  {'run':24} {'mu_hat':>10} {'lcb':>10} {'margin':>10}  {'usd':>8}  verdict")
+    for row in board["rows"]:
+        verdict = "ACCEPT" if row["accepted"] else (row["reason"] or "reject")
+        print(
+            f"  {row['run_id']:24} {_num(row['mu_hat']):>10} {_num(row['lcb']):>10} "
+            f"{_num(row['margin']):>10}  {row['cost_usd']:>8.2f}  {verdict}"
+        )
+    print(
+        "\n  Vectors are stored, verdicts are not. When the throne turns over, "
+        "score\n  the new king once with --record <id> --king and run this again; "
+        "no\n  challenger is re-scored."
+    )
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="evaluate",
@@ -204,6 +344,49 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sampler", action="store_true", help="tier 2 only")
     p.add_argument("--verbose", "-v", action="store_true")
     p.set_defaults(func=cmd_parity)
+
+    corpus = argparse.ArgumentParser(add_help=False)
+    corpus.add_argument("--root", default=str(DEFAULT_ROOT), help="state directory")
+    corpus.add_argument("--evidence", help="evidence store root")
+
+    p = sub.add_parser("plan", parents=[corpus], help="check a holdout before scoring on it")
+    p.add_argument("model_dir")
+    p.add_argument("--holdout", required=True)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_plan)
+
+    p = sub.add_parser(
+        "score", parents=[corpus], help="score a checkpoint into a loss vector"
+    )
+    p.add_argument("model_dir")
+    p.add_argument("--holdout", required=True)
+    p.add_argument("--out", help="write the loss vector here")
+    p.add_argument("--label", help="model label recorded in the vector")
+    p.add_argument("--digest", help="model digest, if known")
+    p.add_argument("--device-map", default="auto")
+    p.add_argument("--limit", type=int, help="score only the first N sequences")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--force", action="store_true", help="score despite holdout warnings")
+    p.add_argument("--record", help="file the vector in the evidence store under this id")
+    p.add_argument("--king", action="store_true", help="record it as the king baseline")
+    p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--gpu-hours", type=float, default=0.0)
+    p.add_argument("--usd-per-gpu-hour", type=float, default=0.0)
+    p.add_argument("--n-gpus", type=int, default=0)
+    p.set_defaults(func=cmd_score)
+
+    p = sub.add_parser(
+        "evidence", parents=[corpus, stats], help="stored measurements and standings"
+    )
+    p.add_argument(
+        "evidence_command",
+        nargs="?",
+        default="standings",
+        choices=("standings", "list", "spend"),
+    )
+    p.add_argument("--king-run-id", help="rank against this king instead of the latest")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_evidence)
 
     return parser
 

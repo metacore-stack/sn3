@@ -304,6 +304,19 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(self.store.read_observations()), 1)
 
 
+class FakePackaging:
+    """Duck-typed stand-in for validate_checkpoint.Report."""
+
+    def __init__(self, would_reject=False, failures=(), fatal=(), skipped=(), determinate=True):
+        self.would_reject = would_reject
+        self.failures = failures
+        self.fatal_failures = fatal
+        self.skipped = skipped
+        self.determinate = determinate
+
+
+CLEAN_PACKAGING = FakePackaging()
+
 class PreflightTests(unittest.TestCase):
     def setUp(self):
         self.dashboard, self.datasets = live_pair()
@@ -345,9 +358,61 @@ class PreflightTests(unittest.TestCase):
             self.live,
             self.dashboard,
             offline_lcb=delta + 0.25,
+            offline_mu=delta + 0.30,
+            packaging=CLEAN_PACKAGING,
             max_age=self.max_age,
         )
         self.assertTrue(result.ok, [c.detail for c in result.blockers])
+
+    def test_blocks_without_a_packaging_report(self):
+        """Two separate gates were one gate too many: green here must mean
+        the artefact is shippable, not merely that the numbers looked good."""
+        delta = self.live.delta or 0.5
+        result = run_preflight(
+            self.live, self.live, self.dashboard,
+            offline_lcb=delta + 0.25, offline_mu=delta + 0.30, max_age=self.max_age,
+        )
+        self.assertFalse(result.ok)
+        self.assertTrue(any("packaging validated" in c.name for c in result.blockers))
+
+    def test_a_rejecting_packaging_report_aborts(self):
+        delta = self.live.delta or 0.5
+        report = FakePackaging(
+            would_reject=True,
+            failures=("a", "b"),
+            fatal=(type("C", (), {"name": "contract files byte-identical"})(),),
+        )
+        result = run_preflight(
+            self.live, self.live, self.dashboard,
+            offline_lcb=delta + 0.25, offline_mu=delta + 0.30,
+            packaging=report, max_age=self.max_age,
+        )
+        self.assertFalse(result.ok)
+        check = next(c for c in result.checks if c.name == "packaging validated")
+        self.assertEqual(check.severity.name, "ABORT")
+        self.assertIn("spent the hotkey", check.detail)
+
+    def test_skipped_packaging_rules_warn_but_do_not_block(self):
+        delta = self.live.delta or 0.5
+        report = FakePackaging(skipped=("a", "b", "c"), determinate=False)
+        result = run_preflight(
+            self.live, self.live, self.dashboard,
+            offline_lcb=delta + 0.25, offline_mu=delta + 0.30,
+            packaging=report, max_age=self.max_age,
+        )
+        self.assertTrue(result.ok)
+        self.assertTrue(any("fully determined" in c.name for c in result.warnings))
+
+    def test_thin_mu_warns_but_does_not_block(self):
+        """The queue argument is strong but not certain; it should not veto."""
+        delta = self.live.delta or 0.5
+        result = run_preflight(
+            self.live, self.live, self.dashboard,
+            offline_lcb=delta + 0.25, offline_mu=0.01,
+            packaging=CLEAN_PACKAGING, max_age=self.max_age,
+        )
+        self.assertTrue(result.ok)
+        self.assertTrue(any("mu_hat" in c.name for c in result.warnings))
 
     def test_stale_dashboard_blocks(self):
         result = run_preflight(
@@ -491,7 +556,9 @@ class WeightPublicationTests(unittest.TestCase):
         )
         delta = self.live.delta or 0.5
         return run_preflight(
-            self.live, self.live, doc, offline_lcb=delta + 0.25, max_age=self.max_age
+            self.live, self.live, doc,
+            offline_lcb=delta + 0.25, offline_mu=delta + 0.30,
+            packaging=CLEAN_PACKAGING, max_age=self.max_age,
         )
 
     def _weight_check(self, result):

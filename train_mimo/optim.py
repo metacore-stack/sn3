@@ -35,12 +35,18 @@ class FreezeResult:
         }
 
 
-def apply_freeze(model, patterns: Sequence[str]) -> FreezeResult:
+def apply_freeze(
+    model, patterns: Sequence[str], exclude: Sequence[str] = ()
+) -> FreezeResult:
     """Enable gradients only for parameters matching ``patterns``.
 
-    An empty pattern list trains everything. Freezing is what makes staged
-    unfreezing cheap: optimizer state is allocated only for what is trainable,
-    which on a 110B model is the difference between fitting and not fitting.
+    An empty pattern list trains everything; ``exclude`` then vetoes by
+    substring, which is how the ``matrices`` stage trains every weight matrix
+    while leaving norms and 1-D vectors frozen.
+
+    Freezing is what makes staged unfreezing cheap: optimizer state is allocated
+    only for what is trainable, which on a 110B model is the difference between
+    fitting and not fitting.
     """
     trainable: list[str] = []
     frozen: list[str] = []
@@ -49,6 +55,8 @@ def apply_freeze(model, patterns: Sequence[str]) -> FreezeResult:
 
     for name, param in model.named_parameters():
         wanted = not patterns or any(p in name for p in patterns)
+        if wanted and exclude and any(x in name for x in exclude):
+            wanted = False
         param.requires_grad_(wanted)
         if wanted:
             trainable.append(name)
@@ -96,9 +104,23 @@ def lr_multiplier(step: int, total: int, config: OptimConfig) -> float:
     if config.schedule == "constant":
         return 1.0
 
+    floor = max(0.0, min(1.0, config.min_lr_ratio))
+
+    if config.schedule == "wsd":
+        # Warmup -> stable at full LR -> short decay. The decay may be pinned
+        # explicitly (branch a cooldown from a running trunk) or derived from
+        # decay_fraction of the total.
+        start = config.decay_start_step
+        if start is None:
+            start = max(warmup, int(total * (1.0 - config.decay_fraction)))
+        if step < start:
+            return 1.0
+        span = max(1, total - start)
+        progress = min(1.0, max(0.0, (step - start) / span))
+        return floor + (1.0 - floor) * (1.0 - progress)
+
     remaining_total = max(1, total - warmup)
     progress = min(1.0, max(0.0, (step - warmup) / remaining_total))
-    floor = max(0.0, min(1.0, config.min_lr_ratio))
 
     if config.schedule == "linear":
         return floor + (1.0 - floor) * (1.0 - progress)

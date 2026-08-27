@@ -133,31 +133,65 @@ def save_checkpoint(
     balancer=None,
     metrics: dict[str, Any] | None = None,
     keep_state: bool = True,
+    context=None,
 ) -> SaveResult:
-    """Write a submittable model directory plus a separate resume state."""
+    """Write a submittable model directory plus a separate resume state.
+
+    Under FSDP the parameters live sharded across ranks, so the full state dict
+    has to be gathered collectively -- every rank must call this -- and only
+    rank zero writes. Saving a shard directly would produce a checkpoint nobody
+    can load.
+    """
     import torch
 
+    from .distributed import DistributedContext, gather_full_state_dict, unwrap
+
+    context = context or DistributedContext()
     output_dir = Path(output_dir)
     model_dir = output_dir / f"checkpoint-{step:06d}"
     state_dir = output_dir / f"state-{step:06d}"
-    model_dir.mkdir(parents=True, exist_ok=True)
 
-    was_training = model.training
-    model.eval()
+    inner = unwrap(model)
+    was_training = inner.training
+    inner.eval()
     try:
-        model.save_pretrained(model_dir, safe_serialization=True)
+        # Collective: all ranks participate, rank zero receives the full dict.
+        state_dict = gather_full_state_dict(model, context)
+    finally:
+        if was_training:
+            inner.train()
+
+    if not context.is_main:
+        # Non-main ranks took part in the gather and are done. They return the
+        # paths so callers can log uniformly, but write nothing.
+        return SaveResult(
+            model_dir=model_dir,
+            state_dir=state_dir,
+            step=step,
+            restored=(),
+            missing_from_king=(),
+            shape_mismatch=(),
+        )
+
+    model_dir.mkdir(parents=True, exist_ok=True)
+    was_training = inner.training
+    inner.eval()
+    try:
+        inner.save_pretrained(
+            model_dir, safe_serialization=True, state_dict=state_dict
+        )
     except Exception as exc:  # noqa: BLE001
         raise CheckpointError(f"save_pretrained failed at step {step}: {exc}") from exc
     finally:
         if was_training:
-            model.train()
+            inner.train()
 
     # Only restore the king's locked files onto a model of the king's shape.
     # Copying them onto a miniature yields a config describing a 110B model
     # beside miniature weights, which then cannot even be reloaded.
     shape_mismatch: tuple[str, ...] = ()
     if king_dir is not None:
-        shape_mismatch = tuple(architecture_matches(model.config, king_dir))
+        shape_mismatch = tuple(architecture_matches(inner.config, king_dir))
     if shape_mismatch:
         restored, missing = (), tuple(LOCKED_FILES)
     else:

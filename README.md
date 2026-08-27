@@ -780,3 +780,212 @@ before it costs a hotkey.
   non-FineWeb shard.
 - **Holdouts failed on small corpora.** Requesting more shards than a source has
   raised instead of widening the per-shard sample. It now clamps.
+
+---
+
+# Everything is built — 2026-08-27
+
+The eight gaps from the last audit are closed. 416 tests pass, up from 302.
+
+## New: `campaign` — the controller
+
+One command for the whole chain, with the bill attached.
+
+```
+campaign init --name attempt-001 --gpus 8 --usd-per-gpu-hour 2.40 --out attempt-001.json
+campaign run attempt-001.json
+campaign status attempt-001.json
+```
+
+Six stages: `state` (what the chain says now) → `data` (the corpora and the
+holdout) → `train` → `score` (into the evidence store) → `validate` (packaging)
+→ `report` (standings and spend). Each stage is journalled, so a campaign
+interrupted in `train` resumes at `train`. `--only`, `--skip`, `--dry-run` and
+`--no-resume` control what runs.
+
+Two properties matter:
+
+- **It blocks before it spends.** Point it at a FineWeb-Edu-only holdout and it
+  stops at `data` with "mixture error 78.0% — this holdout does not measure what
+  the validator scores", before a training run happens.
+- **It cannot submit.** `teutonic-miner ready` is refused by name, and no stage
+  is called submit. That call is irreversible and permanently consumes the
+  hotkey; it stays a decision a person makes by hand.
+
+Cost is attributed only to the stages that occupy the hardware — reading a
+dashboard does not cost eight GPUs — and reported as GPU-hours, dollars, and
+dollars per nat of improvement.
+
+## New: the evidence store
+
+`evaluate_losses/evidence.py` stores **loss vectors, never verdicts**.
+
+A verdict is a statement about two models, and the king changes roughly every
+five hours. Once it does, every stored verdict is wrong and there is no way to
+tell which ones by looking at them. The usual consequence is re-running
+experiments to find out.
+
+Storing the vector makes a king change cost exactly one scoring run:
+
+```
+evaluate score <king-checkpoint> --holdout blend-a --record king-r10 --king
+evaluate evidence standings
+```
+
+Observed on the demo store: three challengers ranked against reign 9, then a
+single new king vector recorded, then all three re-judged — `pilot-002` went
+from `ACCEPT` at `mu_hat 0.308` to a reject at `0.061`. No challenger was
+re-scored; the only new file on disk was the new king's vector.
+
+`evaluate evidence spend` reports dollars-per-nat across every run, dividing by
+the *best* improvement rather than the total, because the runs that lost still
+had to happen to find the one that won.
+
+Vectors that cannot be paired are reported as unrankable rather than compared:
+a different holdout, a changed corpus manifest, or a different engine shape all
+block the pairing. A paired bootstrap over sequences that are not the same
+sequences is not a weaker measurement, it is a meaningless one.
+
+## New: the scoring entry point
+
+```
+evaluate plan  runs/attempt-001/checkpoint-000400 --holdout blend-a
+evaluate score runs/attempt-001/checkpoint-000400 --holdout blend-a --record attempt-001
+```
+
+`plan` checks the holdout before a GPU-hour is spent on it. On the local state:
+
+```
+blend-a   2000 sequences   440/520/1040   mixture error 0.0%
+val-a     5120 sequences   5120/0/0       mixture error 78.0%   ← larger, and wrong
+```
+
+`score` refuses to run on a warned holdout unless `--force` is given.
+
+## New: the king downloader
+
+```
+validate download ./king --king-digest 0d27e6e6… --dry-run
+validate download ./king --king-digest 0d27e6e6…
+validate verify   ./king --king-digest 0d27e6e6…
+```
+
+220.6 GB, parallel, resumable, verified per file against the published
+manifest. Disk is checked before the first byte, not after 200 GB. A dropped
+connection keeps the partial file and continues it with a Range request; a
+server that answers 200 to a Range request restarts that file cleanly rather
+than appending duplicate bytes. The whole-file digest covers the bytes kept from
+the earlier attempt, so a corrupt prefix is caught rather than inherited.
+
+## New: distributed training
+
+`train_mimo/distributed.py`, exercised end to end on CPU with gloo.
+
+The one thing here with no single-process equivalent:
+**expert selection counts must be all-reduced before the routing bias moves.**
+`e_score_correction_bias` receives no gradient, so DDP and FSDP never
+synchronise it; each rank would step it from its own tokens. Nothing raises —
+the checkpoint just quietly carries rank zero's routing.
+
+Measured, at three ranks:
+
+```
+max bias divergence WITHOUT all-reduce   0.200000
+max bias divergence WITH    all-reduce   0.000000
+```
+
+Verified in the suite:
+
+- world sizes 1, 2 and 4 produce **byte-identical** trajectories over the same
+  batches (`scripts/dist_equivalence.py`), with the learning rate pinned to zero
+  so any difference is a sharding bug rather than float-reduction noise;
+- the routing bias is identical across ranks after every step;
+- a checkpoint saved under two ranks resumes with bias, optimizer and step
+  intact (`scripts/dist_resume.py`).
+
+Note that gradient-level bitwise equality across world sizes is *not* claimed.
+Reduction order legitimately varies, and no one can promise it.
+
+## The bug that search found: `attention_sink_bias`
+
+The architecture allocates it and never fills it:
+
+```python
+self.attention_sink_bias = nn.Parameter(
+    torch.empty(self.num_attention_heads), requires_grad=False
+)
+```
+
+There is no `_init_weights` in `modeling_mimo_v2.py`, so transformers' default
+covers Linear, Embedding and the norms but never a bare Parameter. The values
+are concatenated onto the attention logits before the softmax, so whatever was
+in that memory became real attention mass.
+
+The symptom was not a crash. It was that **two processes with the same seed
+disagreed**: 5.536796 in one, 5.546367 in the next. **0.0096 nats of pure noise,
+a tenth of the live delta threshold**, on every local measurement. Same class of
+bug as the uninitialised gate weights found earlier, and it invalidated any
+local comparison finer than about 0.01 nats.
+
+`initialize_attention_sinks` zeroes them, and `uninitialized_parameters` is now
+an exact detector rather than a probabilistic one: `torch.empty` is poisoned
+with NaN during construction, so anything still NaN was never written.
+Comparing two builds had missed layer 3's sink, which happened to recycle the
+same memory twice.
+
+## New: preflight is one gate, not two
+
+`sn3 preflight` now runs the packaging validator itself:
+
+```
+sn3-monitor preflight --against <snapshot> \
+    --model-dir runs/attempt-001/checkpoint-000400 \
+    --offline-lcb 0.21 --offline-mu 0.26 --thorough-packaging
+```
+
+Green now means the artefact is shippable, not merely that the numbers looked
+good. A packaging failure is `ABORT` severity, because roughly 1 in 11 live
+submissions died there and every one of those deaths happened *after* `ready`
+had already spent the hotkey.
+
+It also gained an `offline mu_hat headroom` check, defaulting to a floor of
+`0.11`. You are judged against whoever is king when your evaluation *runs*, not
+when you submit. At ~57 minutes per evaluation, a queue 11 deep puts about ten
+hours — two reigns — between the two. Clearing today's bar by a hair is how a
+submission dies in the queue. It warns rather than blocks, because the argument
+is strong but not certain.
+
+## New: `matrices` stage and the WSD schedule
+
+`--stage matrices` trains every 2-D weight matrix and freezes every 1-D vector,
+which is what the reign 6→7 diff shows the incumbent operator did. The
+default schedule is now warmup-stable-decay with `decay_fraction=0.2`;
+`decay_start_step` pins the cooldown explicitly so a branch can be taken off a
+running trunk.
+
+## Repository hygiene — needs your decision
+
+Two things are wrong with the repo itself, and both matter for the port:
+
+1. **339 MB of `state/` and 72 `.pyc` files are tracked**, including four ~85 MB
+   `.npy` shards. `.gitignore` now covers them, but that only stops future
+   commits; the bytes are already in history, and removing them needs a rewrite
+   and a force-push to a shared remote. That is your call:
+
+   ```
+   git rm -r --cached state/cache state/arch state/king-reference
+   git rm -r --cached $(git ls-files | grep -E '__pycache__|\.pyc$')
+   # history rewrite, destructive, coordinate with anyone who has cloned:
+   #   git filter-repo --path state/cache --path state/arch --invert-paths
+   ```
+
+   Everything removed is reproducible with `fineweb corpus sync`.
+
+2. **The origin remote still embeds a GitHub personal access token in
+   plaintext.** It has been printed to a terminal and must be treated as
+   compromised. Rotate it, then:
+
+   ```
+   git remote set-url origin https://github.com/metacore-stack/sn3.git
+   gh auth login          # or switch to SSH
+   ```

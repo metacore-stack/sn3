@@ -18,10 +18,11 @@ evaluate = "evaluate_losses.cli:main"
 validate = "validate_checkpoint.cli:main"
 mimo-adapter = "mimo_adapter.cli:main"
 train-mimo = "train_mimo.cli:main"
+campaign = "campaign.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["sn3_monitor", "fineweb_loader", "evaluate_losses", "validate_checkpoint", "mimo_adapter", "train_mimo"]
+packages = ["sn3_monitor", "fineweb_loader", "evaluate_losses", "validate_checkpoint", "mimo_adapter", "train_mimo", "campaign"]

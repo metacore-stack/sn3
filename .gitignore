@@ -1,1 +1,35 @@
+# Environments
 .venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Reproducible local state. `fineweb corpus sync` rebuilds all of it, and the
+# shards are ~85 MB each -- 339 MB of it is already in this repo's history.
+state/cache/
+state/arch/
+state/king-reference/
+state/losses/
+state/evidence/
+state/targets/
+state/observations.jsonl
+
+# Kept: the small files that describe what to rebuild.
+!state/dataset-config.json
+!state/fineweb-manifest.json
+!state/manifests/
+!state/holdouts/
+
+# Training output. A single 110B checkpoint is ~220 GB.
+runs/
+king/
+*.safetensors
+*.npy
+
+# Never. Training needs no keys; a wallet on a rented box is a wallet gone.
+*.pem
+*.key
+wallets/
+.bittensor/

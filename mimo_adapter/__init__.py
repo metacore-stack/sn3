@@ -15,7 +15,10 @@ from .miniature import (
     build_miniature,
     count_parameters,
     describe,
+    initialize_attention_sinks,
     initialize_gates,
+    initialize_uninitialized,
+    uninitialized_parameters,
     miniature_config_dict,
 )
 from .patch import (
@@ -33,6 +36,9 @@ __all__ = [
     "load_arch", "fetch_arch", "find_arch_directory", "read_reference_config", "ArchModules",
     "build_miniature", "MiniatureSpec", "miniature_config_dict", "describe", "count_parameters",
     "initialize_gates",
+    "initialize_attention_sinks",
+    "initialize_uninitialized",
+    "uninitialized_parameters",
     "trainable_routing", "recording_routing", "trainable_gate_forward",
     "RoutingRecorder", "gates", "set_gates_eval", "is_patched",
     "run_all", "Report",

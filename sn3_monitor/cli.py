@@ -30,7 +30,7 @@ from .errors import (
 from .fetch import DEFAULT_TIMEOUT, fetch_dashboard, fetch_datasets
 from .history import build_report, recent_table
 from .observe import observation, observed_span, transitions, weight_uptime
-from .preflight import DEFAULT_MARGIN, run_preflight
+from .preflight import DEFAULT_MARGIN, DEFAULT_MU_FLOOR, run_preflight
 from .render import heading, kv, num, paint, pct, table
 from .store import Store
 from .target import Target
@@ -439,16 +439,56 @@ def cmd_watch(args: argparse.Namespace) -> int:
         return EXIT_FRESH
 
 
+def _packaging_report(args: argparse.Namespace):
+    """Run the packaging validator so the interlock is one gate, not two.
+
+    Import is local and failures are reported rather than raised: a missing
+    validate_checkpoint must leave the packaging check unsatisfied, never make
+    preflight look green because it could not run.
+    """
+    if not getattr(args, "model_dir", None):
+        return None
+    try:
+        from validate_checkpoint import Contract, KingReference, Options, validate
+    except ImportError as exc:  # pragma: no cover - packaging always installed here
+        print(f"warning: packaging checks unavailable ({exc})", file=sys.stderr)
+        return None
+
+    king = None
+    digest = getattr(args, "king_digest", None) or getattr(
+        args, "_live_king_digest", None
+    )
+    if digest:
+        try:
+            king = KingReference.from_digest(digest)
+        except Exception as exc:  # noqa: BLE001 - reported, not fatal
+            print(f"warning: king reference unavailable ({exc})", file=sys.stderr)
+
+    options = (
+        Options.thorough()
+        if getattr(args, "thorough_packaging", False)
+        else Options()
+    )
+    return validate(
+        Path(args.model_dir), contract=Contract.load(), king=king, options=options
+    )
+
+
 def cmd_preflight(args: argparse.Namespace) -> int:
     store = Store.open(Path(args.root) if args.root else None)
     pinned = store.load_target(args.against)
     dashboard, _, live = _load_live(args)
+    # Default the packaging king to whoever is actually on the throne now.
+    args._live_king_digest = getattr(live, "king_digest", None)
     result = run_preflight(
         pinned,
         live,
         dashboard,
         offline_lcb=args.offline_lcb,
+        offline_mu=getattr(args, "offline_mu", None),
+        packaging=_packaging_report(args),
         margin=args.margin,
+        mu_floor=getattr(args, "mu_floor", DEFAULT_MU_FLOOR),
         max_age=timedelta(minutes=args.max_age_minutes),
     )
 
@@ -558,7 +598,19 @@ def build_parser() -> argparse.ArgumentParser:
         "preflight", parents=[common, against], help="submission interlock"
     )
     p.add_argument("--offline-lcb", type=float, help="your measured offline LCB")
+    p.add_argument("--offline-mu", type=float, help="your measured offline mean improvement")
     p.add_argument("--margin", type=float, default=DEFAULT_MARGIN)
+    p.add_argument("--mu-floor", type=float, default=DEFAULT_MU_FLOOR)
+    p.add_argument(
+        "--model-dir",
+        help="checkpoint to validate for packaging as part of this gate",
+    )
+    p.add_argument("--king-digest", help="king digest, for the packaging checks that need it")
+    p.add_argument(
+        "--thorough-packaging",
+        action="store_true",
+        help="hash shards and scan for NaN/Inf; slow, but leaves nothing skipped",
+    )
     p.set_defaults(func=cmd_preflight)
 
     return parser

@@ -1,4 +1,5 @@
 [console_scripts]
+campaign = campaign.cli:main
 evaluate = evaluate_losses.cli:main
 fineweb = fineweb_loader.cli:main
 mimo-adapter = mimo_adapter.cli:main

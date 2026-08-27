@@ -12,6 +12,7 @@ exercise the same code path as the 110B checkpoint.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from contextlib import contextmanager
 from typing import Any
 
 # Fields that define routing behaviour. Never overridden by a miniature.
@@ -157,6 +158,100 @@ def initialize_gates(model, config, *, seed: int = 0) -> int:
     return count
 
 
+def initialize_attention_sinks(model) -> int:
+    """Zero the attention sink biases, which are also left uninitialised.
+
+    ``MiMoV2Attention.__init__`` allocates them the same way the gate does::
+
+        self.attention_sink_bias = nn.Parameter(
+            torch.empty(self.num_attention_heads), requires_grad=False
+        )
+
+    and the architecture ships no ``_init_weights``, so transformers' default
+    covers Linear, Embedding and the norms but never a bare Parameter. The
+    values are concatenated onto the attention logits before the softmax, so
+    whatever was in that memory becomes real attention mass.
+
+    The symptom is subtle rather than loud: the model runs, but two processes
+    built from the same seed disagree. Measured on the miniature that was 0.0096
+    nats between runs of an identical config -- a tenth of the live delta
+    threshold, arriving as noise on every comparison.
+
+    Zero is the neutral value: the sink then enters the softmax with the same
+    logit an exactly-orthogonal key would.
+
+    Returns the number of tensors initialised.
+    """
+    import torch
+
+    count = 0
+    for module in model.modules():
+        sink = getattr(module, "attention_sink_bias", None)
+        if sink is None:
+            continue
+        with torch.no_grad():
+            sink.zero_()
+        count += 1
+    return count
+
+
+def initialize_uninitialized(model, config, *, seed: int = 0) -> dict[str, int]:
+    """Every parameter the architecture allocates but never fills."""
+    return {
+        "gates": initialize_gates(model, config, seed=seed),
+        "attention_sinks": initialize_attention_sinks(model),
+    }
+
+
+def uninitialized_parameters(arch, reference: dict[str, Any], spec=None, *, seed: int = 0,
+                             initialize: bool = False) -> list[str]:
+    """Names of parameters no initialiser ever writes.
+
+    Every tensor ``torch.empty`` hands out during construction is poisoned with
+    NaN, so anything still NaN afterwards was never written. That is exact,
+    where comparing two builds is not: uninitialised memory frequently happens
+    to repeat, and a tensor that repeats by luck looks initialised.
+
+    Pass ``initialize=True`` to confirm the repair covers everything.
+    """
+    import torch
+
+    with _poisoned_empty():
+        model, _ = build_miniature(
+            arch, reference, spec, seed=seed, initialize=initialize
+        )
+    return sorted(
+        name
+        for name, param in model.named_parameters()
+        if param.is_floating_point() and bool(torch.isnan(param).any())
+    )
+
+
+@contextmanager
+def _poisoned_empty():
+    """Make ``torch.empty`` return NaN so unwritten memory is identifiable.
+
+    Legitimate initialisers overwrite what ``torch.empty`` returned -- that is
+    the whole pattern, ``nn.Linear`` included -- so only genuinely untouched
+    tensors keep the poison.
+    """
+    import torch
+
+    real = torch.empty
+
+    def poisoned(*args, **kwargs):
+        tensor = real(*args, **kwargs)
+        if tensor.is_floating_point():
+            tensor.fill_(float("nan"))
+        return tensor
+
+    torch.empty = poisoned
+    try:
+        yield
+    finally:
+        torch.empty = real
+
+
 def build_miniature(
     arch,
     reference: dict[str, Any],
@@ -164,16 +259,18 @@ def build_miniature(
     *,
     seed: int = 0,
     dtype: str = "float32",
-    init_gates: bool = True,
+    initialize: bool = True,
 ):
     """Instantiate a miniature ``MiMoV2ForCausalLM`` with random weights.
 
     float32 by default: the point is exact numerical comparison between two
     routing implementations, and bf16 rounding would mask real differences.
 
-    ``init_gates`` is on by default because the architecture leaves routing
-    parameters uninitialised; see :func:`initialize_gates`. Pass ``False`` only
-    to reproduce that failure deliberately.
+    ``initialize`` is on by default because the architecture leaves both the
+    routing parameters and the attention sink biases uninitialised; see
+    :func:`initialize_uninitialized`. Pass ``False`` only to reproduce that
+    failure deliberately -- a model built without it is not reproducible even
+    from a fixed seed.
     """
     import torch
 
@@ -182,8 +279,8 @@ def build_miniature(
 
     torch.manual_seed(seed)
     model = arch.causal_lm_cls(config)
-    if init_gates:
-        initialize_gates(model, config, seed=seed)
+    if initialize:
+        initialize_uninitialized(model, config, seed=seed)
     model = model.to(getattr(torch, dtype))
     model.eval()
     return model, config
