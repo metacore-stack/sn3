@@ -1,0 +1,23 @@
+"""validate_checkpoint — run every rule the SN3 validator runs, before 'ready'.
+
+Roughly 1 in 11 live submissions died on packaging rather than model quality.
+After 'ready' the hotkey is spent permanently, so those checks have to happen
+here instead.
+"""
+
+__version__ = "1.0.0"
+
+from .contract import Contract
+from .errors import ContractError, KingUnavailableError, SafetensorsFormatError, ValidationError
+from .king import KingReference
+from .report import Check, Layer, Report, Status
+from .safetensors_io import SafetensorsHeader, TensorInfo, read_header
+from .validator import Options, validate
+
+__all__ = [
+    "Contract", "KingReference", "Report", "Check", "Layer", "Status",
+    "SafetensorsHeader", "TensorInfo", "read_header",
+    "validate", "Options",
+    "ValidationError", "ContractError", "KingUnavailableError", "SafetensorsFormatError",
+    "__version__",
+]

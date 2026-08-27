@@ -1,0 +1,7 @@
+[console_scripts]
+evaluate = evaluate_losses.cli:main
+fineweb = fineweb_loader.cli:main
+mimo-adapter = mimo_adapter.cli:main
+sn3-monitor = sn3_monitor.cli:main
+train-mimo = train_mimo.cli:main
+validate = validate_checkpoint.cli:main

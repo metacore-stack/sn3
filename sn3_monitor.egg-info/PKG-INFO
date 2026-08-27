@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: sn3-monitor
+Version: 1.0.0
+Summary: Track the Bittensor SN3 (Teutonic) contract and guard irreversible submissions
+Requires-Python: >=3.11
+Requires-Dist: numpy>=1.24
+Provides-Extra: adapter
+Requires-Dist: torch>=2.4; extra == "adapter"
+Requires-Dist: transformers==5.8.1; extra == "adapter"
+Requires-Dist: safetensors>=0.4; extra == "adapter"

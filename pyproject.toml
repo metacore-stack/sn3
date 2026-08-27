@@ -1,0 +1,27 @@
+[project]
+name = "sn3-monitor"
+version = "1.0.0"
+description = "Track the Bittensor SN3 (Teutonic) contract and guard irreversible submissions"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+# The locked modeling_mimo_v2.py targets the transformers release named in the
+# king's config.json. Newer releases changed create_causal_mask's signature and
+# the model will not even build.
+adapter = ["torch>=2.4", "transformers==5.8.1", "safetensors>=0.4"]
+
+[project.scripts]
+sn3-monitor = "sn3_monitor.cli:main"
+fineweb = "fineweb_loader.cli:main"
+evaluate = "evaluate_losses.cli:main"
+validate = "validate_checkpoint.cli:main"
+mimo-adapter = "mimo_adapter.cli:main"
+train-mimo = "train_mimo.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["sn3_monitor", "fineweb_loader", "evaluate_losses", "validate_checkpoint", "mimo_adapter", "train_mimo"]

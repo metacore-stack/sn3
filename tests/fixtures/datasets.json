@@ -1,0 +1,37 @@
+{
+    "chain": {
+        "competition": "Teutonic-II-110B",
+        "generation": "teutonic-II-110B-hf-8f971f030f5d801f812540007b396058f69cc08a",
+        "name": "Teutonic-II-110B",
+        "netuid": 3
+    },
+    "config_version": "7f8db63fd8812e5f6389e9ff8d2c07799c235b5abc0b2fabc783f354487f96f3",
+    "dataset_label": "finewebedu",
+    "delta_threshold": 0.5,
+    "eval_n": 2000,
+    "generated_at": "2026-08-24T08:54:23.452204Z",
+    "sampling": {
+        "algorithm": "blake2b-64-block-hash-hotkey-v1",
+        "inputs": [
+            "block_hash",
+            "hotkey"
+        ]
+    },
+    "schema_version": 1,
+    "sources": [
+        {
+            "dtype": "uint32",
+            "estimated_sequences": 765308773,
+            "manifest_sha256": "130273b000ef130cba39d9f9f467d12498dc7fc7d7e8043132e3bcb584848013",
+            "manifest_url": "https://pub-d923bc4e8fcb45f6b703bc750bcf8aa6.r2.dev/finewebedu/manifest.json",
+            "name": "finewebedu",
+            "proportion": 1.0,
+            "sequence_length": 2048,
+            "source_repo": "HuggingFaceFW/fineweb-edu",
+            "tokenization_mode": "seq_packed_shards_with_lineage",
+            "tokenizer": "XiaomiMiMo/MiMo-V2.5-Pro",
+            "total_shards": 125441,
+            "total_tokens": 1567352367104
+        }
+    ]
+}

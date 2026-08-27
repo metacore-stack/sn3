@@ -1,0 +1,34 @@
+{
+  "competition": "Teutonic-II-110B",
+  "dashboard_source": "https://teutonic.ai/dashboard.json",
+  "dataset_version": "7f8db63fd8812e5f6389e9ff8d2c07799c235b5abc0b2fabc783f354487f96f3",
+  "datasets_source": "https://teutonic.ai/datasets/manifest.json",
+  "delta_from_datasets": 0.5,
+  "delta_from_king": 0.5,
+  "eval_n": 2000,
+  "generation": "teutonic-II-110B-hf-8f971f030f5d801f812540007b396058f69cc08a",
+  "king_crowned_at": "2026-08-25T19:36:41.375017Z",
+  "king_digest": "c345e657a37e82f785b61762516d6405db48272fa5e023ea09f2147f2616e6d0",
+  "king_hotkey": "5DZMJER8BqWj8eZounzRDz6Bgqa9HwRgoRwwwsA7rk8XXhbW",
+  "king_loss": 2.987152,
+  "king_reign": 7,
+  "king_repo": "teutonic-II-110B-A7B-5ek5koe5-v5",
+  "king_uid": 226,
+  "netuid": 3,
+  "notes": [],
+  "pinned_at": "2026-08-26T21:33:20.727443Z",
+  "seed_repo": "dendriteholdings/teutonic-II-110B-genesis",
+  "snapshot_id": "20260826T213320Z-c345e657",
+  "snapshot_version": 1,
+  "sources": [
+    {
+      "manifest_sha256": "130273b000ef130cba39d9f9f467d12498dc7fc7d7e8043132e3bcb584848013",
+      "name": "finewebedu",
+      "proportion": 1.0,
+      "sequence_length": 2048,
+      "tokenizer": "XiaomiMiMo/MiMo-V2.5-Pro",
+      "total_shards": 125441,
+      "total_tokens": 1567352367104
+    }
+  ]
+}

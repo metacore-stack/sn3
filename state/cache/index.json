@@ -1,0 +1,12 @@
+{
+  "budget_bytes": 4294967296,
+  "entries": {
+    "shards/finewebedu__CC-MAIN-2013-20__part0__shard_000000.npy": {
+      "key": "shards/finewebedu__CC-MAIN-2013-20__part0__shard_000000.npy",
+      "last_used": 1787788291.2418735,
+      "name": "finewebedu__CC-MAIN-2013-20__part0__shard_000000.npy",
+      "sha256": "c59a9a50c4161f3676f9c9ef2cdbf8ebcfeaa4bc84aa8dbd0ec634df8f9122e7",
+      "size_bytes": 50331776
+    }
+  }
+}
